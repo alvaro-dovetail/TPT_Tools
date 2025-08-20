@@ -1,7 +1,8 @@
 import sys
 import math
-import bisect
 from typing import Dict, List, Tuple
+
+import numpy as np
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -175,6 +176,81 @@ def build_time_and_signals(
     return t, track_pts, rays, endpoints, signals
 
 
+# Grouping --------------------------------------------------------------------
+
+group_specs = [
+    {
+        "name": "acceleration",
+        "base": "acceleration_pkt",
+        "axes": {
+            "x": "acceleration_pkt.acc_x",
+            "y": "acceleration_pkt.acc_y",
+            "z": "acceleration_pkt.acc_z",
+        },
+        "mag": "acceleration_pkt.acc_mag",
+        "axis_units_key": "acceleration_pkt.acc_x",
+        "colors": {
+            "x": "#d62728",
+            "y": "#2ca02c",
+            "z": "#ff7f0e",
+            "mag": "#1f77b4",
+        },
+    },
+    {
+        "name": "velocity",
+        "base": "velocity_pkt",
+        "axes": {
+            "n": "velocity_pkt.v_n",
+            "e": "velocity_pkt.v_e",
+            "d": "velocity_pkt.v_d",
+        },
+        "mag": "velocity_pkt.v_mag",
+        "axis_units_key": "velocity_pkt.v_n",
+        "colors": {
+            "n": "#d62728",
+            "e": "#2ca02c",
+            "d": "#ff7f0e",
+            "mag": "#1f77b4",
+        },
+    },
+]
+
+
+def build_grouped_signals(
+    signals: Dict[str, List[float]],
+    units_map: Dict[str, str],
+) -> Tuple[List[Dict], List[str]]:
+    """Build grouped signal specs and leftover ungrouped keys."""
+    grouped: List[Dict] = []
+    used: set[str] = set()
+    for spec in group_specs:
+        components: Dict[str, List[float]] = {}
+        key_map: Dict[str, str] = {}
+        for comp, key in spec["axes"].items():
+            if key in signals:
+                components[comp] = signals[key]
+                key_map[comp] = key
+                used.add(key)
+        mag_key = spec.get("mag")
+        if mag_key and mag_key in signals:
+            components["mag"] = signals[mag_key]
+            key_map["mag"] = mag_key
+            used.add(mag_key)
+        if components:
+            unit = units_map.get(spec.get("axis_units_key"))
+            grouped.append(
+                {
+                    "name": spec["name"],
+                    "components": components,
+                    "keys": key_map,
+                    "unit": unit,
+                    "colors": spec["colors"],
+                }
+            )
+    leftover = [k for k in signals.keys() if k not in used]
+    return grouped, leftover
+
+
 # Rendering -------------------------------------------------------------------
 
 def render_map(
@@ -217,16 +293,29 @@ def render_timeseries(
     signals: Dict[str, List[float]],
     units_map: Dict[str, str],
     filter_text: str = '',
-) -> Tuple[List[str], List]:
-    """Render stacked time series plots and return keys and axes."""
+) -> Tuple[List[List[str]], List, List[List[List[float]]]]:
+    """Render stacked time series plots and return keys, axes and data."""
     fig = canvas.figure
     fig.clear()
 
-    keys = [k for k in sorted(signals.keys()) if filter_text.lower() in k.lower()]
-    n = len(keys)
+    grouped, leftover = build_grouped_signals(signals, units_map)
+
+    ft = filter_text.lower()
+    if ft:
+        grouped = [
+            g
+            for g in grouped
+            if ft in g["name"].lower()
+            or any(ft in k.lower() for k in g["keys"].values())
+        ]
+        leftover = sorted([k for k in leftover if ft in k.lower()])
+    else:
+        leftover = sorted(leftover)
+
+    n = len(grouped) + len(leftover)
     if n == 0:
         fig.canvas.draw()
-        return [], []
+        return [], [], []
 
     axes = fig.subplots(
         n,
@@ -236,7 +325,53 @@ def render_timeseries(
     )
     if n == 1:
         axes = [axes]
-    for ax, key in zip(axes, keys):
+
+    axis_keys: List[List[str]] = []
+    axis_data: List[List[List[float]]] = []
+    idx = 0
+
+    for grp in grouped:
+        ax = axes[idx]
+        idx += 1
+        keys_in_axis: List[str] = []
+        data_in_axis: List[List[float]] = []
+        for comp, key in grp["keys"].items():
+            y = grp["components"][comp]
+            ax.plot(
+                t,
+                y,
+                linewidth=1.2,
+                label=comp,
+                color=grp["colors"][comp],
+            )
+            keys_in_axis.append(key)
+            data_in_axis.append(y)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.3)
+        ax.set_ylabel("")
+        ax.tick_params(axis="y", labelleft=False)
+        label = f"{grp['name']}{f' ({grp['unit']})' if grp['unit'] else ''}"
+        ax.text(
+            0.01,
+            0.95,
+            label,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox=dict(
+                boxstyle="round,pad=0.2",
+                facecolor="#ffffff",
+                alpha=0.75,
+                edgecolor="#cccccc",
+            ),
+        )
+        ax.grid(True, linestyle=":", alpha=0.4)
+        axis_keys.append(keys_in_axis)
+        axis_data.append(data_in_axis)
+
+    for key in leftover:
+        ax = axes[idx]
+        idx += 1
         y = signals[key]
         ax.plot(t, y, linewidth=1.0)
         ax.set_ylabel("")
@@ -259,6 +394,9 @@ def render_timeseries(
             ),
         )
         ax.grid(True, linestyle=":", alpha=0.4)
+        axis_keys.append([key])
+        axis_data.append([y])
+
     axes[-1].set_xlabel("Time (s)")
 
     for a, b in zip(axes[:-1], axes[1:]):
@@ -277,7 +415,7 @@ def render_timeseries(
     if hasattr(canvas, "setMinimumHeight"):
         canvas.setMinimumHeight(int(fig.get_figheight() * fig.dpi))
     fig.canvas.draw()
-    return keys, axes
+    return axis_keys, axes, axis_data
 
 
 class SharedCrosshair:
@@ -288,8 +426,8 @@ class SharedCrosshair:
         canvas: FigureCanvas,
         axes: List,
         t: List[float],
-        data: List[List[float]],
-        keys: List[str],
+        data: List[List[List[float]]],
+        keys: List[List[str]],
         status_bar=None,
     ) -> None:
         self.canvas = canvas
@@ -299,12 +437,16 @@ class SharedCrosshair:
         self.keys = keys
         self.status = status_bar
         self.vlines = []
-        self.markers = []
-        for ax in axes:
+        self.markers: List[List] = []
+        for ax, series in zip(axes, data):
+            lines = list(ax.get_lines())
             v = ax.axvline(0, color="red", linewidth=0.8, alpha=0.7, visible=False)
-            m, = ax.plot([], [], "o", color="red", markersize=4, visible=False)
+            marker_list = []
+            for line in lines:
+                m, = ax.plot([], [], "o", color=line.get_color(), markersize=4, visible=False)
+                marker_list.append(m)
             self.vlines.append(v)
-            self.markers.append(m)
+            self.markers.append(marker_list)
         self.backgrounds: Dict = {}
         self.cids: List[int] = []
         self.enabled = False
@@ -337,41 +479,45 @@ class SharedCrosshair:
         if event.xdata is None:
             self._hide()
             return
-        idx = bisect.bisect_left(self.t, event.xdata)
+        idx = np.searchsorted(self.t, event.xdata)
         idx = max(0, min(idx, len(self.t) - 1))
         time = self.t[idx]
-        for ax, v, m, y in zip(self.axes, self.vlines, self.markers, self.data):
+        for ax, v, marks, series in zip(
+            self.axes, self.vlines, self.markers, self.data
+        ):
             if ax in self.backgrounds:
                 self.canvas.restore_region(self.backgrounds[ax])
             v.set_xdata([time, time])
             v.set_ydata(ax.get_ylim())
             v.set_visible(True)
-            if y:
-                j = min(idx, len(y) - 1)
-                m.set_data([time], [y[j]])
-                m.set_visible(True)
+            for m, y in zip(marks, series):
+                if y:
+                    j = min(idx, len(y) - 1)
+                    m.set_data([time], [y[j]])
+                    m.set_visible(True)
+                ax.draw_artist(m)
             ax.draw_artist(v)
-            ax.draw_artist(m)
             self.canvas.blit(ax.bbox)
         if self.status and event.inaxes in self.axes:
             a_idx = self.axes.index(event.inaxes)
-            y = self.data[a_idx]
-            y_val = y[min(idx, len(y) - 1)] if y else float("nan")
-            self.status.showMessage(
-                f"t={time:.3f}s  {self.keys[a_idx]}={y_val:.3f}"
-            )
+            msgs = []
+            for key, y in zip(self.keys[a_idx], self.data[a_idx]):
+                val = y[min(idx, len(y) - 1)] if y else float("nan")
+                msgs.append(f"{key}={val:.3f}")
+            self.status.showMessage(f"t={time:.3f}s  " + "  ".join(msgs))
 
     def _on_leave(self, _event) -> None:
         self._hide()
 
     def _hide(self) -> None:
-        for ax, v, m in zip(self.axes, self.vlines, self.markers):
+        for ax, v, marks in zip(self.axes, self.vlines, self.markers):
             if ax in self.backgrounds:
                 self.canvas.restore_region(self.backgrounds[ax])
             v.set_visible(False)
-            m.set_visible(False)
             ax.draw_artist(v)
-            ax.draw_artist(m)
+            for m in marks:
+                m.set_visible(False)
+                ax.draw_artist(m)
             self.canvas.blit(ax.bbox)
         if self.status:
             self.status.clearMessage()
@@ -543,13 +689,12 @@ class MainWindow(QMainWindow):
         if self.crosshair:
             self.crosshair.disable()
             self.crosshair = None
-        keys, axes = render_timeseries(
+        axis_keys, axes, axis_data = render_timeseries(
             self.ts_canvas, self.t, self.signals, self.units_map, filter_text
         )
         if axes:
-            data = [self.signals[k] for k in keys]
             self.crosshair = SharedCrosshair(
-                self.ts_canvas, axes, self.t, data, keys, self.statusBar()
+                self.ts_canvas, axes, self.t, axis_data, axis_keys, self.statusBar()
             )
             if self.tabs.currentWidget() is self.ts_tab:
                 self.crosshair.enable()
