@@ -1,5 +1,6 @@
 import sys
 import math
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -525,10 +526,57 @@ class SharedCrosshair:
 
 # KML -------------------------------------------------------------------------
 
+GX_TRACK_LIMIT = 50_000
+
+
+def make_gx_track_kml(
+    t: List[float],
+    track_pts: List[Tuple[float, float, float]],
+    arrays: Dict[str, List[float]],
+    max_points: int = GX_TRACK_LIMIT,
+) -> str:
+    """Build a gx:Track placemark with optional thinning and arrays."""
+
+    if not t or not track_pts:
+        return ""
+
+    step = max(1, len(track_pts) // max_points) if max_points and len(track_pts) > max_points else 1
+    t0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    track_lines: List[str] = []
+    for ts, pt in zip(t[::step], track_pts[::step]):
+        when = (t0 + timedelta(seconds=ts)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        track_lines.append(f"<when>{when}</when>")
+        track_lines.append(f"<gx:coord>{pt[0]:.9f} {pt[1]:.9f} {pt[2]:.3f}</gx:coord>")
+
+    array_parts: List[str] = []
+    for name, values in arrays.items():
+        vals: List[str] = []
+        for v in values[::step]:
+            vals.append(f"<gx:value>{'' if math.isnan(v) else f'{v:.6g}'}</gx:value>")
+        array_parts.append(
+            f"<gx:SimpleArrayData name=\"{name}\">{''.join(vals)}</gx:SimpleArrayData>"
+        )
+
+    extended = (
+        f"<ExtendedData><SchemaData schemaUrl=\"#ts_schema\">{''.join(array_parts)}</SchemaData></ExtendedData>"
+        if array_parts
+        else ""
+    )
+
+    return (
+        f"<Placemark><name>Track (time series)</name><styleUrl>#track</styleUrl>"
+        f"{extended}<gx:Track><altitudeMode>absolute</altitudeMode>"
+        f"{''.join(track_lines)}</gx:Track></Placemark>"
+    )
+
+
 def make_kml(
+    t: List[float],
     track: List[Tuple[float, float, float]],
     rays: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
     endpoints: List[Tuple[float, float, float]],
+    signals: Dict[str, List[float]],
     rays_limit: int,
 ) -> str:
     def fmt(pt: Tuple[float, float, float]) -> str:
@@ -543,13 +591,46 @@ def make_kml(
             f"<LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{coords}</coordinates></LineString>"
         )
     envelope_coords = ' '.join(fmt(p) for p in endpoints)
+
+    field_specs = [
+        ("speed_mps", "velocity_pkt.v_mag", "Speed (m/s)"),
+        ("tas_mps", "body_pkt.tas", "TAS (m/s)"),
+        ("acc_x_mps2", "acceleration_pkt.acc_x", "Acc X (m/s^2)"),
+        ("acc_y_mps2", "acceleration_pkt.acc_y", "Acc Y (m/s^2)"),
+        ("acc_z_mps2", "acceleration_pkt.acc_z", "Acc Z (m/s^2)"),
+        ("acc_mag_mps2", "acceleration_pkt.acc_mag", "Acc Mag (m/s^2)"),
+        ("hdg_deg", "position_pkt.heading", "Heading (deg)"),
+        ("pitch_deg", "position_pkt.pitch", "Pitch (deg)"),
+        ("roll_deg", "position_pkt.roll", "Roll (deg)"),
+    ]
+
+    arrays: Dict[str, List[float]] = {}
+    display_names: Dict[str, str] = {}
+    for name, src, disp in field_specs:
+        vals = signals.get(src)
+        if vals:
+            arrays[name] = vals
+            display_names[name] = disp
+
+    schema = ""
+    if arrays:
+        fields = []
+        for name, disp in display_names.items():
+            fields.append(
+                f"<gx:SimpleArrayField name=\"{name}\" type=\"float\"><displayName>{disp}</displayName></gx:SimpleArrayField>"
+            )
+        schema = f"<Schema id=\"ts_schema\">{''.join(fields)}</Schema>"
+
+    gx_track = make_gx_track_kml(t, track, arrays)
+
     return f"""<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
 <Document>
   <name>Track Export</name>
   <Style id="track"><LineStyle><color>ff00ffff</color><width>3</width></LineStyle></Style>
   <Style id="rays"><LineStyle><color>9900ffff</color><width>1</width></LineStyle></Style>
   <Style id="envelope"><LineStyle><color>ff00a5ff</color><width>3</width></LineStyle></Style>
+  {schema}
   <Placemark><name>Track</name><styleUrl>#track</styleUrl>
     <LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{track_coords}</coordinates></LineString>
   </Placemark>
@@ -559,6 +640,7 @@ def make_kml(
   <Placemark><name>Envelope</name><styleUrl>#envelope</styleUrl>
     <LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{envelope_coords}</coordinates></LineString>
   </Placemark>
+  {gx_track}
 </Document>
 </kml>"""
 
@@ -715,7 +797,14 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        kml = make_kml(self.track, self.rays, self.endpoints, self.rays_spin.value())
+        kml = make_kml(
+            self.t,
+            self.track,
+            self.rays,
+            self.endpoints,
+            self.signals,
+            self.rays_spin.value(),
+        )
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(kml)
