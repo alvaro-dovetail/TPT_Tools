@@ -1,5 +1,6 @@
 import sys
 import math
+import bisect
 from typing import Dict, List, Tuple
 
 from PySide6.QtWidgets import (
@@ -16,8 +17,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
 )
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import (
+    FigureCanvasQTAgg as FigureCanvas,
+    NavigationToolbar2QT,
+)
 from matplotlib.figure import Figure
+import matplotlib
 
 
 # Parsing ---------------------------------------------------------------------
@@ -210,8 +215,10 @@ def render_timeseries(
     canvas: FigureCanvas,
     t: List[float],
     signals: Dict[str, List[float]],
+    units_map: Dict[str, str],
     filter_text: str = '',
-) -> None:
+) -> Tuple[List[str], List]:
+    """Render stacked time series plots and return keys and axes."""
     fig = canvas.figure
     fig.clear()
 
@@ -219,20 +226,155 @@ def render_timeseries(
     n = len(keys)
     if n == 0:
         fig.canvas.draw()
-        return
+        return [], []
 
-    axes = fig.subplots(n, 1, sharex=True)
+    axes = fig.subplots(
+        n,
+        1,
+        sharex=True,
+        gridspec_kw={"hspace": 0.35, "left": 0.07, "right": 0.98, "top": 0.98, "bottom": 0.05},
+    )
     if n == 1:
         axes = [axes]
     for ax, key in zip(axes, keys):
-        ax.plot(t, signals[key])
-        ax.set_ylabel(key)
-    axes[-1].set_xlabel('Time (s)')
-    fig.tight_layout()
+        y = signals[key]
+        ax.plot(t, y, linewidth=1.0)
+        ax.set_ylabel("")
+        ax.tick_params(axis="y", labelleft=False)
+        unit = units_map.get(key)
+        label = f"{key}{f' ({unit})' if unit else ''}"
+        ax.text(
+            0.01,
+            0.95,
+            label,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox=dict(
+                boxstyle="round,pad=0.2",
+                facecolor="#ffffff",
+                alpha=0.75,
+                edgecolor="#cccccc",
+            ),
+        )
+        ax.grid(True, linestyle=":", alpha=0.4)
+    axes[-1].set_xlabel("Time (s)")
+
+    for a, b in zip(axes[:-1], axes[1:]):
+        ymid = (a.get_position().y0 + b.get_position().y1) / 2.0
+        fig.lines.append(
+            matplotlib.lines.Line2D(
+                [0.05, 0.98],
+                [ymid, ymid],
+                transform=fig.transFigure,
+                color="#dddddd",
+                linewidth=1,
+            )
+        )
+
     fig.set_figheight(max(1, n) * 1.2)
     if hasattr(canvas, "setMinimumHeight"):
         canvas.setMinimumHeight(int(fig.get_figheight() * fig.dpi))
     fig.canvas.draw()
+    return keys, axes
+
+
+class SharedCrosshair:
+    """Synchronized crosshair across multiple axes with blitting."""
+
+    def __init__(
+        self,
+        canvas: FigureCanvas,
+        axes: List,
+        t: List[float],
+        data: List[List[float]],
+        keys: List[str],
+        status_bar=None,
+    ) -> None:
+        self.canvas = canvas
+        self.axes = axes
+        self.t = t
+        self.data = data
+        self.keys = keys
+        self.status = status_bar
+        self.vlines = []
+        self.markers = []
+        for ax in axes:
+            v = ax.axvline(0, color="red", linewidth=0.8, alpha=0.7, visible=False)
+            m, = ax.plot([], [], "o", color="red", markersize=4, visible=False)
+            self.vlines.append(v)
+            self.markers.append(m)
+        self.backgrounds: Dict = {}
+        self.cids: List[int] = []
+        self.enabled = False
+
+    # ------------------------------------------------------------------
+    def enable(self) -> None:
+        if not self.enabled:
+            self.cids.append(self.canvas.mpl_connect("draw_event", self._on_draw))
+            self.cids.append(
+                self.canvas.mpl_connect("motion_notify_event", self._on_move)
+            )
+            self.cids.append(
+                self.canvas.mpl_connect("axes_leave_event", self._on_leave)
+            )
+            self.enabled = True
+
+    def disable(self) -> None:
+        for cid in self.cids:
+            self.canvas.mpl_disconnect(cid)
+        self.cids.clear()
+        self.enabled = False
+        self._hide()
+
+    # ------------------------------------------------------------------
+    def _on_draw(self, _event) -> None:
+        for ax in self.axes:
+            self.backgrounds[ax] = self.canvas.copy_from_bbox(ax.bbox)
+
+    def _on_move(self, event) -> None:
+        if event.xdata is None:
+            self._hide()
+            return
+        idx = bisect.bisect_left(self.t, event.xdata)
+        idx = max(0, min(idx, len(self.t) - 1))
+        time = self.t[idx]
+        for ax, v, m, y in zip(self.axes, self.vlines, self.markers, self.data):
+            if ax in self.backgrounds:
+                self.canvas.restore_region(self.backgrounds[ax])
+            v.set_xdata([time, time])
+            v.set_ydata(ax.get_ylim())
+            v.set_visible(True)
+            if y:
+                j = min(idx, len(y) - 1)
+                m.set_data([time], [y[j]])
+                m.set_visible(True)
+            ax.draw_artist(v)
+            ax.draw_artist(m)
+            self.canvas.blit(ax.bbox)
+        if self.status and event.inaxes in self.axes:
+            a_idx = self.axes.index(event.inaxes)
+            y = self.data[a_idx]
+            y_val = y[min(idx, len(y) - 1)] if y else float("nan")
+            self.status.showMessage(
+                f"t={time:.3f}s  {self.keys[a_idx]}={y_val:.3f}"
+            )
+
+    def _on_leave(self, _event) -> None:
+        self._hide()
+
+    def _hide(self) -> None:
+        for ax, v, m in zip(self.axes, self.vlines, self.markers):
+            if ax in self.backgrounds:
+                self.canvas.restore_region(self.backgrounds[ax])
+            v.set_visible(False)
+            m.set_visible(False)
+            ax.draw_artist(v)
+            ax.draw_artist(m)
+            self.canvas.blit(ax.bbox)
+        if self.status:
+            self.status.clearMessage()
 
 
 # KML -------------------------------------------------------------------------
@@ -288,6 +430,8 @@ class MainWindow(QMainWindow):
         self.rays: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = []
         self.endpoints: List[Tuple[float, float, float]] = []
         self.signals: Dict[str, List[float]] = {}
+        self.units_map: Dict[str, str] = {}
+        self.crosshair: SharedCrosshair | None = None
 
         open_btn = QPushButton('Open…')
         open_btn.clicked.connect(self.open_file)
@@ -329,15 +473,25 @@ class MainWindow(QMainWindow):
         self.ts_fig = Figure()
         self.ts_canvas = FigureCanvas(self.ts_fig)
         self.ts_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        ts_scroll = QScrollArea()
-        ts_scroll.setWidget(self.ts_canvas)
-        ts_scroll.setWidgetResizable(True)
+        self.ts_toolbar = NavigationToolbar2QT(self.ts_canvas, self)
+
+        self.ts_plot_container = QWidget()
+        pc_layout = QVBoxLayout()
+        pc_layout.setContentsMargins(0, 0, 0, 0)
+        pc_layout.addWidget(self.ts_toolbar)
+        pc_layout.addWidget(self.ts_canvas)
+        self.ts_plot_container.setLayout(pc_layout)
+
+        self.ts_scroll = QScrollArea()
+        self.ts_scroll.setWidget(self.ts_plot_container)
+        self.ts_scroll.setWidgetResizable(True)
 
         ts_layout = QVBoxLayout()
         ts_layout.addWidget(self.filter_edit)
-        ts_layout.addWidget(ts_scroll)
+        ts_layout.addWidget(self.ts_scroll)
         ts_widget = QWidget()
         ts_widget.setLayout(ts_layout)
+        self.ts_tab = ts_widget
         self.tabs.addTab(ts_widget, 'Time Series')
 
         layout = QVBoxLayout()
@@ -347,6 +501,7 @@ class MainWindow(QMainWindow):
         central.setLayout(layout)
         self.setCentralWidget(central)
         self.statusBar()
+        self.tabs.currentChanged.connect(self.on_tab_changed)
 
     # ------------------------------------------------------------------
     def open_file(self) -> None:
@@ -366,6 +521,7 @@ class MainWindow(QMainWindow):
             self.t, self.track, self.rays, self.endpoints, self.signals = build_time_and_signals(
                 rows, vaunit_map
             )
+            self.units_map = vaunit_map
         except Exception as exc:  # pragma: no cover - display error in UI
             self.statusBar().showMessage(f'Error: {exc}')
             return
@@ -384,7 +540,26 @@ class MainWindow(QMainWindow):
     def update_timeseries(self) -> None:
         self.filter_edit.setVisible(len(self.signals) > 50)
         filter_text = self.filter_edit.text() if self.filter_edit.isVisible() else ''
-        render_timeseries(self.ts_canvas, self.t, self.signals, filter_text)
+        if self.crosshair:
+            self.crosshair.disable()
+            self.crosshair = None
+        keys, axes = render_timeseries(
+            self.ts_canvas, self.t, self.signals, self.units_map, filter_text
+        )
+        if axes:
+            data = [self.signals[k] for k in keys]
+            self.crosshair = SharedCrosshair(
+                self.ts_canvas, axes, self.t, data, keys, self.statusBar()
+            )
+            if self.tabs.currentWidget() is self.ts_tab:
+                self.crosshair.enable()
+
+    def on_tab_changed(self, idx: int) -> None:
+        if self.crosshair:
+            if self.tabs.widget(idx) is self.ts_tab:
+                self.crosshair.enable()
+            else:
+                self.crosshair.disable()
 
     def export_kml(self) -> None:
         if not self.track:
