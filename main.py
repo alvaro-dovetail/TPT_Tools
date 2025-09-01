@@ -1,9 +1,11 @@
 import sys
 import math
+import json
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple
-
+from typing import Dict, List, Tuple, Optional
+import os
 import numpy as np
+from xml.sax.saxutils import escape as xml_escape
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QSizePolicy,
+    QLabel,
 )
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -26,11 +29,15 @@ from matplotlib.backends.backend_qtagg import (
 from matplotlib.figure import Figure
 import matplotlib
 
+# -----------------------------------------------------------------------------
+# TUNABLES for visual smoothing / densifying
+SMOOTH_WINDOW = 7        # odd >=3 recommended; 1 disables smoothing
+DENSIFY_FACTOR = 6       # >=1; 1 disables densifying
+# -----------------------------------------------------------------------------
 
 # Parsing ---------------------------------------------------------------------
 
 def parse_headers(lines: List[str]) -> Tuple[List[str], Dict[str, str], int]:
-    """Parse header lines and return field tokens, units map and header index."""
     field_tokens: List[str] | None = None
     units_tokens: List[str] | None = None
     header_index = -1
@@ -38,13 +45,10 @@ def parse_headers(lines: List[str]) -> Tuple[List[str], Dict[str, str], int]:
     for idx, line in enumerate(lines):
         if line.startswith('<TIME>,HEADER,,VAUNIT'):
             units_tokens = line.strip().split(',')[4:]
-        elif (
-            line.startswith('<TIME>,HEADER,,,position_pkt,')
-            and 'ballistic_extrapolation_position_pkt' in line
-        ):
+        if (line.startswith('<TIME>,HEADER,,,position_pkt,')
+                and 'ballistic_extrapolation_position_pkt' in line):
             field_tokens = line.strip().split(',')[4:]
             header_index = idx
-            break
 
     if field_tokens is None:
         raise ValueError('Required field header not found')
@@ -121,7 +125,13 @@ def _convert(value: float, unit: str | None) -> float:
 
 def build_time_and_signals(
     rows: List[Dict[str, float]], vaunit_map: Dict[str, str]
-) -> Tuple[List[float], List[Tuple[float, float, float]], List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]], List[Tuple[float, float, float]], Dict[str, List[float]]]:
+) -> Tuple[
+    List[float],
+    List[Tuple[float, float, float]],
+    List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
+    List[Tuple[float, float, float]],
+    Dict[str, List[float]],
+]:
     """Build time axis, track, rays, endpoints and signals."""
     exclude = {
         'position_pkt.longitude',
@@ -163,9 +173,10 @@ def build_time_and_signals(
         latb = _convert(row.get('ballistic_extrapolation_position_pkt.latitude', float('nan')), vaunit_map.get('ballistic_extrapolation_position_pkt.latitude'))
         altb = _convert(row.get('ballistic_extrapolation_position_pkt.height', float('nan')), vaunit_map.get('ballistic_extrapolation_position_pkt.height'))
 
-        track_pts.append((lon, lat, alt))
         start = (lon, lat, alt)
         end = (lonb, latb, altb)
+
+        track_pts.append(start)
         rays.append((start, end))
         endpoints.append(end)
 
@@ -260,30 +271,51 @@ def render_map(
     rays: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
     endpoints: List[Tuple[float, float, float]],
     rays_limit: int,
+    safety_line: Optional[List[Tuple[float, float, float]]] = None,
+    crowd_line: Optional[List[Tuple[float, float, float]]] = None,
 ) -> None:
     ax.clear()
-    if not track_pts:
-        ax.figure.canvas.draw()
-        return
+    any_legend = False
 
-    lons = [p[0] for p in track_pts]
-    lats = [p[1] for p in track_pts]
-    ax.plot(lons, lats, color='yellow', linewidth=3, label='Track')
+    # Track: green, alpha 0.8, width 2
+    if track_pts:
+        lons = [p[0] for p in track_pts]
+        lats = [p[1] for p in track_pts]
+        ax.plot(lons, lats, color=(0.0, 1.0, 0.0, 0.8), linewidth=2, label='Track')
+        any_legend = True
 
+    # Rays: unchanged (yellow-ish, alpha 0.3, width 1)
     if rays:
         step = max(1, len(rays) // max(1, rays_limit))
         for a, b in rays[::step]:
             ax.plot([a[0], b[0]], [a[1], b[1]], color=(1, 1, 0, 0.3), linewidth=1)
 
+    # Envelope unchanged (orange, width 3)
     if endpoints:
         lons_e = [p[0] for p in endpoints]
         lats_e = [p[1] for p in endpoints]
         ax.plot(lons_e, lats_e, color='orange', linewidth=3, label='Envelope')
+        any_legend = True
+
+    # Safety line: yellow, alpha 0.6, width 8
+    if safety_line:
+        lons_s = [p[0] for p in safety_line]
+        lats_s = [p[1] for p in safety_line]
+        ax.plot(lons_s, lats_s, color=(1.0, 1.0, 0.0, 0.6), linewidth=8, label='Safety Line')
+        any_legend = True
+
+    # Crowd line: #aa00ff, alpha 0.6, width 8
+    if crowd_line:
+        lons_c = [p[0] for p in crowd_line]
+        lats_c = [p[1] for p in crowd_line]
+        ax.plot(lons_c, lats_c, color=(170/255.0, 0.0, 1.0, 0.6), linewidth=8, label='Crowd Line')
+        any_legend = True
 
     ax.set_xlabel('Longitude (deg)')
     ax.set_ylabel('Latitude (deg)')
     ax.set_aspect('equal', adjustable='datalim')
-    ax.legend(loc='best')
+    if any_legend:
+        ax.legend(loc='best')
     ax.figure.tight_layout()
     ax.figure.canvas.draw()
 
@@ -324,8 +356,7 @@ def render_timeseries(
         sharex=True,
         gridspec_kw={"hspace": 0.35, "left": 0.07, "right": 0.98, "top": 0.98, "bottom": 0.05},
     )
-    if n == 1:
-        axes = [axes]
+    axes = np.atleast_1d(axes).ravel().tolist()
 
     axis_keys: List[List[str]] = []
     axis_data: List[List[List[float]]] = []
@@ -338,12 +369,14 @@ def render_timeseries(
         data_in_axis: List[List[float]] = []
         for comp, key in grp["keys"].items():
             y = grp["components"][comp]
+            ls = "--" if comp != "mag" else "-"   # dashed for axes, solid for magnitude
             ax.plot(
                 t,
                 y,
                 linewidth=1.2,
                 label=comp,
                 color=grp["colors"][comp],
+                linestyle=ls,
             )
             keys_in_axis.append(key)
             data_in_axis.append(y)
@@ -439,11 +472,10 @@ class SharedCrosshair:
         self.status = status_bar
         self.vlines = []
         self.markers: List[List] = []
-        for ax, series in zip(axes, data):
-            lines = list(ax.get_lines())
+        for ax, _series in zip(axes, data):
             v = ax.axvline(0, color="red", linewidth=0.8, alpha=0.7, visible=False)
             marker_list = []
-            for line in lines:
+            for line in ax.get_lines():
                 m, = ax.plot([], [], "o", color=line.get_color(), markersize=4, visible=False)
                 marker_list.append(m)
             self.vlines.append(v)
@@ -452,16 +484,11 @@ class SharedCrosshair:
         self.cids: List[int] = []
         self.enabled = False
 
-    # ------------------------------------------------------------------
     def enable(self) -> None:
         if not self.enabled:
             self.cids.append(self.canvas.mpl_connect("draw_event", self._on_draw))
-            self.cids.append(
-                self.canvas.mpl_connect("motion_notify_event", self._on_move)
-            )
-            self.cids.append(
-                self.canvas.mpl_connect("axes_leave_event", self._on_leave)
-            )
+            self.cids.append(self.canvas.mpl_connect("motion_notify_event", self._on_move))
+            self.cids.append(self.canvas.mpl_connect("axes_leave_event", self._on_leave))
             self.enabled = True
 
     def disable(self) -> None:
@@ -471,7 +498,6 @@ class SharedCrosshair:
         self.enabled = False
         self._hide()
 
-    # ------------------------------------------------------------------
     def _on_draw(self, _event) -> None:
         for ax in self.axes:
             self.backgrounds[ax] = self.canvas.copy_from_bbox(ax.bbox)
@@ -483,9 +509,7 @@ class SharedCrosshair:
         idx = np.searchsorted(self.t, event.xdata)
         idx = max(0, min(idx, len(self.t) - 1))
         time = self.t[idx]
-        for ax, v, marks, series in zip(
-            self.axes, self.vlines, self.markers, self.data
-        ):
+        for ax, v, marks, series in zip(self.axes, self.vlines, self.markers, self.data):
             if ax in self.backgrounds:
                 self.canvas.restore_region(self.backgrounds[ax])
             v.set_xdata([time, time])
@@ -524,9 +548,79 @@ class SharedCrosshair:
             self.status.clearMessage()
 
 
+# Helpers for smoothing / densifying -----------------------------------------
+
+def _moving_average_path(
+    points: List[Tuple[float, float, float]], window: int
+) -> List[Tuple[float, float, float]]:
+    """Edge-preserving moving average on lon/lat/alt; length preserved."""
+    if window is None or window <= 1 or len(points) < 3:
+        return points
+    if window % 2 == 0:
+        window += 1
+    arr = np.asarray(points, dtype=float)  # Nx3
+    pad = window // 2
+    arrp = np.pad(arr, ((pad, pad), (0, 0)), mode='edge')
+    kernel = np.ones(window, dtype=float) / window
+    smoothed = np.empty_like(arr)
+    for col in range(3):
+        smoothed[:, col] = np.convolve(arrp[:, col], kernel, mode='valid')
+    return [tuple(row) for row in smoothed.tolist()]
+
+
+def _moving_average_1d(values: List[float], window: int) -> List[float]:
+    """Edge-preserving moving average for 1D time series; length preserved."""
+    if window is None or window <= 1 or len(values) < 3:
+        return values
+    if window % 2 == 0:
+        window += 1
+    arr = np.asarray(values, dtype=float)
+    pad = window // 2
+    kernel = np.ones(window, dtype=float) / window
+    arrp = np.pad(arr, pad, mode='edge')
+    smoothed = np.convolve(arrp, kernel, mode='valid')
+    nan_mask = np.isnan(arr)
+    smoothed[nan_mask] = np.nan
+    return smoothed.tolist()
+
+
+def _densify_line(
+    points: List[Tuple[float, float, float]], factor: int
+) -> List[Tuple[float, float, float]]:
+    """Linear interpolation between points; preserves endpoints."""
+    if factor is None or factor <= 1 or len(points) < 2:
+        return points
+    dense: List[Tuple[float, float, float]] = []
+    for a, b in zip(points, points[1:]):
+        dense.append(a)
+        for k in range(1, factor):
+            s = k / factor
+            dense.append((
+                a[0] * (1 - s) + b[0] * s,
+                a[1] * (1 - s) + b[1] * s,
+                a[2] * (1 - s) + b[2] * s,
+            ))
+    dense.append(points[-1])
+    return dense
+
+
 # KML -------------------------------------------------------------------------
 
-GX_TRACK_LIMIT = 50_000
+GX_TRACK_LIMIT = 50_000  # keep
+KNOTS_PER_MPS = 1.9438444924574
+G_PER_MPS2 = 1.0 / 9.80665
+
+def _ffill_numeric(values: List[float], target_len: int) -> List[float]:
+    out: List[float] = []
+    last = 0.0
+    vals = (values[:target_len] + [math.nan] * max(0, target_len - len(values)))
+    for v in vals:
+        if v is None or not math.isfinite(v):
+            out.append(last)
+        else:
+            last = float(v)
+            out.append(last)
+    return out
 
 
 def make_gx_track_kml(
@@ -535,39 +629,47 @@ def make_gx_track_kml(
     arrays: Dict[str, List[float]],
     max_points: int = GX_TRACK_LIMIT,
 ) -> str:
-    """Build a gx:Track placemark with optional thinning and arrays."""
-
+    """Build a gx:Track placemark with per-sample arrays suitable for GE's Elevation Profile."""
     if not t or not track_pts:
         return ""
 
+    # Thin uniformly
     step = max(1, len(track_pts) // max_points) if max_points and len(track_pts) > max_points else 1
+    t_thin = t[::step]
+    pts_thin = track_pts[::step]
+    N = min(len(t_thin), len(pts_thin))
+    t_thin = t_thin[:N]
+    pts_thin = pts_thin[:N]
+
+    # Build <when> + <gx:coord>
     t0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-    track_lines: List[str] = []
-    for ts, pt in zip(t[::step], track_pts[::step]):
+    when_lines: List[str] = []
+    coord_lines: List[str] = []
+    for ts, pt in zip(t_thin, pts_thin):
         when = (t0 + timedelta(seconds=ts)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        track_lines.append(f"<when>{when}</when>")
-        track_lines.append(f"<gx:coord>{pt[0]:.9f} {pt[1]:.9f} {pt[2]:.3f}</gx:coord>")
+        when_lines.append(f"<when>{when}</when>")
+        coord_lines.append(f"<gx:coord>{pt[0]:.9f} {pt[1]:.9f} {pt[2]:.3f}</gx:coord>")
 
+    # Clean arrays: numeric, N-length, forward-filled
     array_parts: List[str] = []
     for name, values in arrays.items():
-        vals: List[str] = []
-        for v in values[::step]:
-            vals.append(f"<gx:value>{'' if math.isnan(v) else f'{v:.6g}'}</gx:value>")
-        array_parts.append(
-            f"<gx:SimpleArrayData name=\"{name}\">{''.join(vals)}</gx:SimpleArrayData>"
-        )
+        cleaned = _ffill_numeric(values[::step], N)
+        vals = "".join(f"<gx:value>{v:.6g}</gx:value>" for v in cleaned)
+        array_parts.append(f"<gx:SimpleArrayData name=\"{name}\">{vals}</gx:SimpleArrayData>")
 
-    extended = (
-        f"<ExtendedData><SchemaData schemaUrl=\"#ts_schema\">{''.join(array_parts)}</SchemaData></ExtendedData>"
-        if array_parts
-        else ""
-    )
+    ext = f"<ExtendedData><SchemaData schemaUrl=\"#ts_schema\">{''.join(array_parts)}</SchemaData></ExtendedData>" if array_parts else ""
 
     return (
-        f"<Placemark><name>Track (time series)</name><styleUrl>#track</styleUrl>"
-        f"{extended}<gx:Track><altitudeMode>absolute</altitudeMode>"
-        f"{''.join(track_lines)}</gx:Track></Placemark>"
+        "<Placemark>"
+        "<name>Track (time series)</name>"
+        "<styleUrl>#track</styleUrl>"
+        "<gx:Track>"
+        "<altitudeMode>absolute</altitudeMode>"
+        f"{ext}"
+        f"{''.join(when_lines)}"
+        f"{''.join(coord_lines)}"
+        "</gx:Track>"
+        "</Placemark>"
     )
 
 
@@ -578,38 +680,69 @@ def make_kml(
     endpoints: List[Tuple[float, float, float]],
     signals: Dict[str, List[float]],
     rays_limit: int,
+    *,
+    doc_name: str = "Track Export",
+    smooth_window: int = SMOOTH_WINDOW,
+    densify_factor: int = DENSIFY_FACTOR,
+    safety_line: Optional[List[Tuple[float, float, float]]] = None,
+    crowd_line: Optional[List[Tuple[float, float, float]]] = None,
 ) -> str:
     def fmt(pt: Tuple[float, float, float]) -> str:
         return f"{pt[0]:.9f},{pt[1]:.9f},{pt[2]:.3f}"
 
-    track_coords = ' '.join(fmt(p) for p in track)
-    step = max(1, len(rays) // max(1, rays_limit)) if rays else 1
+    # --- Apply smoothing to track coordinates ---
+    smoothed_track = _moving_average_path(track, smooth_window)
+
+    # --- Build visual track (densified from smoothed) ---
+    dense_track = _densify_line(smoothed_track, densify_factor)
+    track_coords = " ".join(fmt(p) for p in dense_track)
+
+    # --- Rays: re-anchor starts to the smoothed track ---
+    rays_visual = list(zip(smoothed_track, endpoints))
+    step = max(1, len(rays_visual) // max(1, rays_limit)) if rays_visual else 1
     ray_strings = []
-    for a, b in rays[::step]:
+    for a, b in rays_visual[::step]:
         coords = f"{fmt(a)} {fmt(b)}"
         ray_strings.append(
-            f"<LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{coords}</coordinates></LineString>"
+            "<LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode>"
+            f"<coordinates>{coords}</coordinates></LineString>"
         )
-    envelope_coords = ' '.join(fmt(p) for p in endpoints)
 
+    envelope_coords = " ".join(fmt(p) for p in endpoints)
+
+    # Arrays (converted + smoothed)
     field_specs = [
-        ("speed_mps", "velocity_pkt.v_mag", "Speed (m/s)"),
-        ("tas_mps", "body_pkt.tas", "TAS (m/s)"),
-        ("acc_x_mps2", "acceleration_pkt.acc_x", "Acc X (m/s^2)"),
-        ("acc_y_mps2", "acceleration_pkt.acc_y", "Acc Y (m/s^2)"),
-        ("acc_z_mps2", "acceleration_pkt.acc_z", "Acc Z (m/s^2)"),
-        ("acc_mag_mps2", "acceleration_pkt.acc_mag", "Acc Mag (m/s^2)"),
-        ("hdg_deg", "position_pkt.heading", "Heading (deg)"),
-        ("pitch_deg", "position_pkt.pitch", "Pitch (deg)"),
-        ("roll_deg", "position_pkt.roll", "Roll (deg)"),
+        ("speed_kt",     "velocity_pkt.v_mag",          "Speed (kt)",      lambda v: v * KNOTS_PER_MPS),
+        ("tas_kt",       "body_pkt.tas",                "TAS (kt)",        lambda v: v * KNOTS_PER_MPS),
+        ("v_n_mps",      "velocity_pkt.v_n",            "V_N (m/s)",       None),
+        ("v_e_mps",      "velocity_pkt.v_e",            "V_E (m/s)",       None),
+        ("v_d_mps",      "velocity_pkt.v_d",            "V_D (m/s)",       None),
+        ("acc_x_mps2",   "acceleration_pkt.acc_x",      "Acc X (m/s^2)",   None),
+        ("acc_y_mps2",   "acceleration_pkt.acc_y",      "Acc Y (m/s^2)",   None),
+        ("acc_z_mps2",   "acceleration_pkt.acc_z",      "Acc Z (m/s^2)",   None),
+        ("acc_mag_g",    "acceleration_pkt.acc_mag",    "Acc Mag (g)",     lambda v: v * G_PER_MPS2),
+        ("hdg_deg",      "position_pkt.heading",        "Heading (deg)",   None),
+        ("pitch_deg",    "position_pkt.pitch",          "Pitch (deg)",     None),
+        ("roll_deg",     "position_pkt.roll",           "Roll (deg)",      None),
+        ("alpha_deg",    "body_pkt.alpha",              "Alpha (deg)",     None),
+        ("beta_deg",     "body_pkt.beta",               "Beta (deg)",      None),
+        ("aileron",      "parameter_pkt.aileron",       "Aileron",         None),
+        ("elevator",     "parameter_pkt.elevator",      "Elevator",        None),
+        ("rudder",       "parameter_pkt.rudder",        "Rudder",          None),
+        ("thrust",       "parameter_pkt.thrust",        "Thrust",          None),
     ]
 
     arrays: Dict[str, List[float]] = {}
     display_names: Dict[str, str] = {}
-    for name, src, disp in field_specs:
+    for name, src, disp, conv in field_specs:
         vals = signals.get(src)
         if vals:
-            arrays[name] = vals
+            if conv:
+                converted_vals = [float('nan') if (v is None or not math.isfinite(v)) else conv(v) for v in vals]
+            else:
+                converted_vals = vals
+            smoothed_vals = _moving_average_1d(converted_vals, smooth_window)
+            arrays[name] = smoothed_vals
             display_names[name] = disp
 
     schema = ""
@@ -617,36 +750,123 @@ def make_kml(
         fields = []
         for name, disp in display_names.items():
             fields.append(
-                f"<gx:SimpleArrayField name=\"{name}\" type=\"float\"><displayName>{disp}</displayName></gx:SimpleArrayField>"
+                f'<gx:SimpleArrayField name="{name}" type="float"><displayName>{disp}</displayName></gx:SimpleArrayField>'
             )
         schema = f"<Schema id=\"ts_schema\">{''.join(fields)}</Schema>"
 
-    gx_track = make_gx_track_kml(t, track, arrays)
+    gx_track = make_gx_track_kml(t, smoothed_track, arrays)
+
+    # Safety & Crowd lines (clampToGround)
+    def line_to_kml(name: str, style: str, line: List[Tuple[float, float, float]]) -> str:
+        coords = " ".join(f"{p[0]:.9f},{p[1]:.9f},0" for p in line)
+        return f"""
+    <Placemark><name>{xml_escape(name)}</name><styleUrl>#{style}</styleUrl>
+      <LineString><tessellate>1</tessellate><altitudeMode>clampToGround</altitudeMode>
+        <coordinates>{coords}</coordinates>
+      </LineString>
+    </Placemark>""".rstrip()
+
+    safety_kml = line_to_kml("Safety Line", "safety", safety_line) if safety_line else ""
+    crowd_kml  = line_to_kml("Crowd Line",  "crowd",  crowd_line)  if crowd_line  else ""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
-<Document>
-  <name>Track Export</name>
-  <Style id="track"><LineStyle><color>ff00ffff</color><width>3</width></LineStyle></Style>
-  <Style id="rays"><LineStyle><color>9900ffff</color><width>1</width></LineStyle></Style>
-  <Style id="envelope"><LineStyle><color>ff00a5ff</color><width>3</width></LineStyle></Style>
-  {schema}
-  <Placemark><name>Track</name><styleUrl>#track</styleUrl>
-    <LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{track_coords}</coordinates></LineString>
-  </Placemark>
-  <Placemark><name>Rays</name><styleUrl>#rays</styleUrl>
-    <MultiGeometry>{''.join(ray_strings)}</MultiGeometry>
-  </Placemark>
-  <Placemark><name>Envelope</name><styleUrl>#envelope</styleUrl>
-    <LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{envelope_coords}</coordinates></LineString>
-  </Placemark>
-  {gx_track}
-</Document>
+  <Document>
+    <name>{xml_escape(doc_name)}</name>
+
+    <!-- Track: green, 80% opacity, width 2 -->
+    <Style id="track"><LineStyle><color>cc00ff00</color><width>2</width></LineStyle></Style>
+    <!-- Rays: unchanged (yellow, 60% opacity, width 1) -->
+    <Style id="rays"><LineStyle><color>9900ffff</color><width>1</width></LineStyle></Style>
+    <Style id="envelope"><LineStyle><color>ff00a5ff</color><width>3</width></LineStyle></Style>
+    <!-- Safety: yellow, 60% opacity, width 8 -->
+    <Style id="safety"><LineStyle><color>9900ffff</color><width>8</width></LineStyle></Style>
+    <!-- Crowd: #aa00ff, 60% opacity, width 8 -->
+    <Style id="crowd"><LineStyle><color>99ff00aa</color><width>8</width></LineStyle></Style>
+
+    {schema}
+
+    <Placemark><name>Track</name><styleUrl>#track</styleUrl>
+      <LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode>
+        <coordinates>{track_coords}</coordinates>
+      </LineString>
+    </Placemark>
+
+    <Placemark><name>Rays</name><styleUrl>#rays</styleUrl>
+      <MultiGeometry>{''.join(ray_strings)}</MultiGeometry>
+    </Placemark>
+
+    <Placemark><name>Envelope</name><styleUrl>#envelope</styleUrl>
+      <LineString><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode>
+        <coordinates>{envelope_coords}</coordinates>
+      </LineString>
+    </Placemark>
+
+    {safety_kml}
+    {crowd_kml}
+
+    {gx_track}
+
+  </Document>
 </kml>"""
 
 
-# Application -----------------------------------------------------------------
+# ---- Track JSON parser (raceBoxList -> safetyLine / crowdLine) --------------
 
+def parse_track_spec_json(path: str) -> Tuple[Optional[str],
+                                              Optional[List[Tuple[float, float, float]]],
+                                              Optional[List[Tuple[float, float, float]]]]:
+    """
+    Returns (project_name, safety_line_points, crowd_line_points)
+    Each line is a list of (lon, lat, 0.0).
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    project = None
+    if isinstance(data, dict) and 'raceBoxList' in data:
+        project = data
+    elif isinstance(data, list):
+        for obj in data:
+            if isinstance(obj, dict) and 'raceBoxList' in obj:
+                project = obj
+                break
+    if project is None:
+        raise ValueError("raceBoxList not found in track JSON")
+
+    name = project.get('name')
+    safety: Optional[List[Tuple[float, float, float]]] = None
+    crowd:  Optional[List[Tuple[float, float, float]]] = None
+
+    def get_lon_lat(corner: dict) -> Tuple[Optional[float], Optional[float]]:
+        lon = corner.get('longitude')
+        if lon is None:
+            lon = corner.get('longitudeDeg')
+        lat = corner.get('latitude')
+        if lat is None:
+            lat = corner.get('latitudeDeg')
+        return (float(lon) if lon is not None else None,
+                float(lat) if lat is not None else None)
+
+    for rb in project.get('raceBoxList', []):
+        rb_id = str(rb.get('id', '')).lower()
+        pts: List[Tuple[float, float, float]] = []
+        for c in rb.get('cornerList', []):
+            lon, lat = get_lon_lat(c)
+            if lon is None or lat is None:
+                continue
+            pts.append((lon, lat, 0.0))
+        if not pts:
+            continue
+        if rb_id == 'safetyline':
+            safety = pts
+        elif rb_id == 'crowdline':
+            crowd = pts
+
+    return name, safety, crowd
+
+
+# Application -----------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -660,9 +880,19 @@ class MainWindow(QMainWindow):
         self.signals: Dict[str, List[float]] = {}
         self.units_map: Dict[str, str] = {}
         self.crosshair: SharedCrosshair | None = None
+        self.current_path: str | None = None
+
+        # Track spec (safety/crowd)
+        self.track_spec_path: Optional[str] = None
+        self.track_spec_name: Optional[str] = None
+        self.safety_line: Optional[List[Tuple[float, float, float]]] = None
+        self.crowd_line: Optional[List[Tuple[float, float, float]]] = None
 
         open_btn = QPushButton('Open…')
         open_btn.clicked.connect(self.open_file)
+
+        load_track_btn = QPushButton('Load Track JSON…')
+        load_track_btn.clicked.connect(self.load_track_json)
 
         self.rays_spin = QSpinBox()
         self.rays_spin.setRange(1, 1_000_000)
@@ -674,10 +904,22 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.export_kml)
 
+        self.loaded_label = QLabel("Loaded flight: —")
+        self.loaded_label.setStyleSheet("color: #666;")
+
+        self.spec_label = QLabel("Track spec: —")
+        self.spec_label.setStyleSheet("color: #666;")
+
         top = QHBoxLayout()
         top.addWidget(open_btn)
+        top.addWidget(load_track_btn)
         top.addWidget(self.rays_spin)
         top.addWidget(self.export_btn)
+        top.addStretch(1)
+        top.addWidget(self.loaded_label)
+        top.addSpacing(12)
+        top.addWidget(self.spec_label)
+
         top_widget = QWidget()
         top_widget.setLayout(top)
 
@@ -750,7 +992,9 @@ class MainWindow(QMainWindow):
                 rows, vaunit_map
             )
             self.units_map = vaunit_map
-        except Exception as exc:  # pragma: no cover - display error in UI
+            self.current_path = path
+            self.loaded_label.setText(f"Loaded flight: {os.path.basename(path)}")
+        except Exception as exc:
             self.statusBar().showMessage(f'Error: {exc}')
             return
         self.export_btn.setEnabled(True)
@@ -760,26 +1004,79 @@ class MainWindow(QMainWindow):
         self.update_map()
         self.update_timeseries()
 
+    def load_track_json(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Load Track JSON',
+            '',
+            'Track JSON (*.json);;All files (*)',
+        )
+        if not path:
+            return
+        try:
+            name, safety, crowd = parse_track_spec_json(path)
+            self.track_spec_path = path
+            self.track_spec_name = name or os.path.splitext(os.path.basename(path))[0]
+            self.safety_line = safety
+            self.crowd_line = crowd
+            self.spec_label.setText(f"Track spec: {os.path.basename(path)}")
+            self.statusBar().showMessage(
+                f'Loaded track JSON "{os.path.basename(path)}"  '
+                f'({"safety" if safety else "no safety"}/{ "crowd" if crowd else "no crowd"})'
+            )
+        except Exception as exc:
+            self.statusBar().showMessage(f'Error loading track JSON: {exc}')
+            self.track_spec_path = None
+            self.track_spec_name = None
+            self.safety_line = None
+            self.crowd_line = None
+        self.update_map()
+
     def update_map(self) -> None:
+        # Apply smoothing to track for display
+        smoothed_track = _moving_average_path(self.track, SMOOTH_WINDOW)
+        # Update rays to use smoothed track as start points
+        smoothed_rays = list(zip(smoothed_track, self.endpoints)) if len(smoothed_track) == len(self.endpoints) else self.rays
         render_map(
-            self.map_ax, self.track, self.rays, self.endpoints, self.rays_spin.value()
+            self.map_ax,
+            smoothed_track,
+            smoothed_rays,
+            self.endpoints,
+            self.rays_spin.value(),
+            safety_line=self.safety_line,
+            crowd_line=self.crowd_line,
         )
 
     def update_timeseries(self) -> None:
+        # Show filter only when it's useful
         self.filter_edit.setVisible(len(self.signals) > 50)
         filter_text = self.filter_edit.text() if self.filter_edit.isVisible() else ''
+
+        # Tear down any previous crosshair
         if self.crosshair:
             self.crosshair.disable()
             self.crosshair = None
+
+        # Smooth all signals for plotting
+        smoothed_signals = {k: _moving_average_1d(v, SMOOTH_WINDOW) for k, v in self.signals.items()}
+
+        # Re-render plots
         axis_keys, axes, axis_data = render_timeseries(
-            self.ts_canvas, self.t, self.signals, self.units_map, filter_text
+            self.ts_canvas, self.t, smoothed_signals, self.units_map, filter_text
         )
-        if axes:
-            self.crosshair = SharedCrosshair(
-                self.ts_canvas, axes, self.t, axis_data, axis_keys, self.statusBar()
-            )
-            if self.tabs.currentWidget() is self.ts_tab:
-                self.crosshair.enable()
+
+        # If nothing to show, clear figure + status
+        if not isinstance(axes, list) or len(axes) == 0:
+            self.statusBar().clearMessage()
+            self.ts_canvas.draw_idle()
+            return
+
+        # Recreate crosshair for the new axes
+        self.crosshair = SharedCrosshair(
+            self.ts_canvas, axes, self.t, axis_data, axis_keys, self.statusBar()
+        )
+        if self.tabs.currentWidget() is self.ts_tab:
+            self.crosshair.enable()
 
     def on_tab_changed(self, idx: int) -> None:
         if self.crosshair:
@@ -792,24 +1089,41 @@ class MainWindow(QMainWindow):
         if not self.track:
             self.statusBar().showMessage('No data to export')
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'Save KML', '', 'KML files (*.kml)'
+
+        # Default name/path = input base name + .kml
+        suggested = "export.kml"
+        start_dir = ""
+        doc_name = "Track Export"
+        if self.current_path:
+            base = os.path.splitext(os.path.basename(self.current_path))[0]
+            suggested = base + ".kml"
+            start_dir = os.path.dirname(self.current_path)
+            doc_name = base
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, 'Save KML', os.path.join(start_dir, suggested), 'KML files (*.kml)'
         )
-        if not path:
+        if not save_path:
             return
+
         kml = make_kml(
             self.t,
-            self.track,
+            self.track,          # smoothing applied inside make_kml
             self.rays,
             self.endpoints,
             self.signals,
             self.rays_spin.value(),
+            doc_name=doc_name,
+            smooth_window=SMOOTH_WINDOW,
+            densify_factor=DENSIFY_FACTOR,
+            safety_line=self.safety_line,
+            crowd_line=self.crowd_line,
         )
         try:
-            with open(path, 'w', encoding='utf-8') as f:
+            with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(kml)
-            self.statusBar().showMessage(f'Saved {path}')
-        except Exception as exc:  # pragma: no cover - display error in UI
+            self.statusBar().showMessage(f'Saved {save_path}')
+        except Exception as exc:
             self.statusBar().showMessage(f'Error: {exc}')
 
 
