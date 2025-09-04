@@ -678,8 +678,19 @@ def make_gx_track_kml(
     )
 
 
+def _find_project_from_any_root(root: object) -> Optional[dict]:
+    """Accept either a dict or a list root and return the first dict with 'trackList'."""
+    if isinstance(root, dict):
+        return root
+    if isinstance(root, list):
+        for obj in root:
+            if isinstance(obj, dict) and ('trackList' in obj or 'raceBoxList' in obj):
+                return obj
+    return None
+
+
 def make_gate_models_kml(
-    track_spec: dict,
+    track_spec: object,
     assets_dir: str = "assets",
     *,
     scale: Tuple[float, float, float] = GATE_MODEL_SCALE,
@@ -690,21 +701,19 @@ def make_gate_models_kml(
     global GATE_MODEL_WARNINGS
     GATE_MODEL_WARNINGS = []
 
-    if not isinstance(track_spec, dict):
+    project = _find_project_from_any_root(track_spec)
+    if not isinstance(project, dict):
         return ""
 
     # Determine gate list
     gate_list: Optional[List[dict]] = None
-    tracks = track_spec.get("trackList") if isinstance(track_spec.get("trackList"), list) else None
+    tracks = project.get("trackList") if isinstance(project.get("trackList"), list) else None
     if tracks:
-        first = tracks[0] if len(tracks) > 0 else None
-        if isinstance(first, dict) and first.get("gateList"):
-            gate_list = first.get("gateList")
-        else:
-            for tr in tracks:
-                if isinstance(tr, dict) and tr.get("gateList"):
-                    gate_list = tr.get("gateList")
-                    break
+        # prefer the first track with gateList
+        for tr in tracks:
+            if isinstance(tr, dict) and tr.get("gateList"):
+                gate_list = tr.get("gateList")
+                break
     if not gate_list:
         return ""
 
@@ -755,7 +764,7 @@ def make_gate_models_kml(
 
         placemarks.append(
             "<Placemark>"
-            f"<name>Gate {gate.get('id')} [{gtype}]</name>"
+            f"<name>Gate {xml_escape(str(gate.get('id')))} [{xml_escape(str(gtype))}]</name>"
             "<Model>"
             f"<altitudeMode>{altitude_mode}</altitudeMode>"
             "<Location>"
@@ -798,7 +807,7 @@ def make_kml(
     densify_factor: int = DENSIFY_FACTOR,
     safety_line: Optional[List[Tuple[float, float, float]]] = None,
     crowd_line: Optional[List[Tuple[float, float, float]]] = None,
-    track_spec: dict | None = None,
+    track_spec: object | None = None,
     assets_dir: str = "assets",
 ) -> str:
     def fmt(pt: Tuple[float, float, float]) -> str:
@@ -825,6 +834,8 @@ def make_kml(
     envelope_coords = " ".join(fmt(p) for p in endpoints)
 
     # Arrays (converted + smoothed)
+    KNOTS_PER_MPS = 1.9438444924574
+    G_PER_MPS2 = 1.0 / 9.80665
     field_specs = [
         ("speed_kt",     "velocity_pkt.v_mag",          "Speed (kt)",      lambda v: v * KNOTS_PER_MPS),
         ("tas_kt",       "body_pkt.tas",                "TAS (kt)",        lambda v: v * KNOTS_PER_MPS),
@@ -890,9 +901,9 @@ def make_kml(
   <Document>
     <name>{xml_escape(doc_name)}</name>
 
-    <!-- Track: green, 80% opacity, width 2 -->
+    <!-- Track: green, 80% opacity, width 2 (ABGR in KML) -->
     <Style id="track"><LineStyle><color>cc00ff00</color><width>2</width></LineStyle></Style>
-    <!-- Rays: unchanged (yellow, 60% opacity, width 1) -->
+    <!-- Rays: yellow-ish, 60% opacity, width 1 -->
     <Style id="rays"><LineStyle><color>9900ffff</color><width>1</width></LineStyle></Style>
     <Style id="envelope"><LineStyle><color>ff00a5ff</color><width>3</width></LineStyle></Style>
     <!-- Safety: yellow, 60% opacity, width 8 -->
@@ -929,28 +940,23 @@ def make_kml(
 </kml>"""
 
 
-# ---- Track JSON parser (raceBoxList -> safetyLine / crowdLine) --------------
+# ---- Track JSON parser (returns project dict + safetyLine / crowdLine) ------
 
-def parse_track_spec_json(path: str) -> Tuple[Optional[str],
+def parse_track_spec_json(path: str) -> Tuple[dict,
+                                              Optional[str],
                                               Optional[List[Tuple[float, float, float]]],
                                               Optional[List[Tuple[float, float, float]]]]:
     """
-    Returns (project_name, safety_line_points, crowd_line_points)
+    Returns (project_dict, project_name, safety_line_points, crowd_line_points)
     Each line is a list of (lon, lat, 0.0).
     """
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    project = None
-    if isinstance(data, dict) and 'raceBoxList' in data:
-        project = data
-    elif isinstance(data, list):
-        for obj in data:
-            if isinstance(obj, dict) and 'raceBoxList' in obj:
-                project = obj
-                break
-    if project is None:
-        raise ValueError("raceBoxList not found in track JSON")
+    # Find the main project object (handle list or dict roots)
+    project = _find_project_from_any_root(data)
+    if project is None or not isinstance(project, dict):
+        raise ValueError("Project object with raceBoxList/trackList not found in track JSON")
 
     name = project.get('name')
     safety: Optional[List[Tuple[float, float, float]]] = None
@@ -981,7 +987,7 @@ def parse_track_spec_json(path: str) -> Tuple[Optional[str],
         elif rb_id == 'crowdline':
             crowd = pts
 
-    return name, safety, crowd
+    return project, name, safety, crowd
 
 
 # Application -----------------------------------------------------------------
@@ -1000,7 +1006,7 @@ class MainWindow(QMainWindow):
         self.crosshair: SharedCrosshair | None = None
         self.current_path: str | None = None
 
-        # Track spec (safety/crowd)
+        # Track spec (project + safety/crowd)
         self.track_spec_path: Optional[str] = None
         self.track_spec_name: Optional[str] = None
         self.track_spec: Optional[dict] = None
@@ -1133,11 +1139,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                self.track_spec = json.load(f)
-            name, safety, crowd = parse_track_spec_json(path)
+            project, name, safety, crowd = parse_track_spec_json(path)
             self.track_spec_path = path
             self.track_spec_name = name or os.path.splitext(os.path.basename(path))[0]
+            self.track_spec = project  # <-- store the project dict (has trackList/gateList)
             self.safety_line = safety
             self.crowd_line = crowd
             self.spec_label.setText(f"Track spec: {os.path.basename(path)}")
