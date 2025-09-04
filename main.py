@@ -33,6 +33,11 @@ import matplotlib
 # TUNABLES for visual smoothing / densifying
 SMOOTH_WINDOW = 7        # odd >=3 recommended; 1 disables smoothing
 DENSIFY_FACTOR = 6       # >=1; 1 disables densifying
+# 3D gate model scale for KML exports
+GATE_MODEL_SCALE = (1.0, 1.0, 1.0)
+
+# Warnings collected during KML generation (e.g. missing assets)
+GATE_MODEL_WARNINGS: List[str] = []
 # -----------------------------------------------------------------------------
 
 # Parsing ---------------------------------------------------------------------
@@ -673,6 +678,113 @@ def make_gx_track_kml(
     )
 
 
+def make_gate_models_kml(
+    track_spec: dict,
+    assets_dir: str = "assets",
+    *,
+    scale: Tuple[float, float, float] = GATE_MODEL_SCALE,
+    altitude_mode: str = "absolute",
+) -> str:
+    """Return concatenated KML placemarks for all gates in a track spec."""
+
+    global GATE_MODEL_WARNINGS
+    GATE_MODEL_WARNINGS = []
+
+    if not isinstance(track_spec, dict):
+        return ""
+
+    # Determine gate list
+    gate_list: Optional[List[dict]] = None
+    tracks = track_spec.get("trackList") if isinstance(track_spec.get("trackList"), list) else None
+    if tracks:
+        first = tracks[0] if len(tracks) > 0 else None
+        if isinstance(first, dict) and first.get("gateList"):
+            gate_list = first.get("gateList")
+        else:
+            for tr in tracks:
+                if isinstance(tr, dict) and tr.get("gateList"):
+                    gate_list = tr.get("gateList")
+                    break
+    if not gate_list:
+        return ""
+
+    type_map = {
+        "StartGate": "StartGate.dae",
+        "TwinGate": "Gate.dae",
+        "SingleLeft": "SinglePylonGate.dae",
+        "SingleRight": "SinglePylonGate.dae",
+    }
+
+    placemarks: List[str] = []
+    missing_files: set[str] = set()
+    assets_dir_exists = os.path.isdir(assets_dir)
+    assets_base = os.path.basename(os.path.normpath(assets_dir)) or assets_dir
+
+    for gate in gate_list:
+        gtype = gate.get("type")
+        filename = type_map.get(gtype)
+        if not filename:
+            GATE_MODEL_WARNINGS.append(f"Unrecognized gate type: {gtype}")
+            continue
+
+        heading = float(gate.get("headingDeg", 0.0))
+        if gtype == "SingleRight":
+            heading += 180.0
+        heading = heading % 360.0
+
+        pos = gate.get("position", {}) or {}
+        lat = pos.get("latitude")
+        if lat is None:
+            lat = pos.get("latitudeDeg")
+        lon = pos.get("longitude")
+        if lon is None:
+            lon = pos.get("longitudeDeg")
+        if lat is None or lon is None:
+            GATE_MODEL_WARNINGS.append(f"Gate {gate.get('id')} missing lat/lon")
+            continue
+        elev = pos.get("elevationM")
+        if elev is None:
+            elev = pos.get("elevation", 0.0)
+
+        href = f"{assets_base}/{filename}".replace("\\", "/")
+        if assets_dir_exists:
+            if not os.path.isfile(os.path.join(assets_dir, filename)):
+                missing_files.add(href)
+        else:
+            missing_files.add(href)
+
+        placemarks.append(
+            "<Placemark>"
+            f"<name>Gate {gate.get('id')} [{gtype}]</name>"
+            "<Model>"
+            f"<altitudeMode>{altitude_mode}</altitudeMode>"
+            "<Location>"
+            f"<longitude>{lon}</longitude>"
+            f"<latitude>{lat}</latitude>"
+            f"<altitude>{elev}</altitude>"
+            "</Location>"
+            "<Orientation>"
+            f"<heading>{heading}</heading>"
+            "<tilt>0</tilt><roll>0</roll>"
+            "</Orientation>"
+            "<Scale>"
+            f"<x>{scale[0]}</x><y>{scale[1]}</y><z>{scale[2]}</z>"
+            "</Scale>"
+            "<Link>"
+            f"<href>{href}</href>"
+            "</Link>"
+            "</Model>"
+            "</Placemark>"
+        )
+
+    if not assets_dir_exists:
+        GATE_MODEL_WARNINGS.append(f"Missing assets folder: {assets_base}")
+    for m in sorted(missing_files):
+        GATE_MODEL_WARNINGS.append(f"Missing model file: {m}")
+
+    return "".join(placemarks)
+
+
 def make_kml(
     t: List[float],
     track: List[Tuple[float, float, float]],
@@ -686,6 +798,8 @@ def make_kml(
     densify_factor: int = DENSIFY_FACTOR,
     safety_line: Optional[List[Tuple[float, float, float]]] = None,
     crowd_line: Optional[List[Tuple[float, float, float]]] = None,
+    track_spec: dict | None = None,
+    assets_dir: str = "assets",
 ) -> str:
     def fmt(pt: Tuple[float, float, float]) -> str:
         return f"{pt[0]:.9f},{pt[1]:.9f},{pt[2]:.3f}"
@@ -768,6 +882,8 @@ def make_kml(
 
     safety_kml = line_to_kml("Safety Line", "safety", safety_line) if safety_line else ""
     crowd_kml  = line_to_kml("Crowd Line",  "crowd",  crowd_line)  if crowd_line  else ""
+    gates_kml = make_gate_models_kml(track_spec, assets_dir) if track_spec else ""
+    gates_folder = f"<Folder>\n  <name>Gates</name>\n  {gates_kml}\n</Folder>" if gates_kml else ""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
@@ -806,6 +922,8 @@ def make_kml(
     {crowd_kml}
 
     {gx_track}
+
+    {gates_folder}
 
   </Document>
 </kml>"""
@@ -885,6 +1003,7 @@ class MainWindow(QMainWindow):
         # Track spec (safety/crowd)
         self.track_spec_path: Optional[str] = None
         self.track_spec_name: Optional[str] = None
+        self.track_spec: Optional[dict] = None
         self.safety_line: Optional[List[Tuple[float, float, float]]] = None
         self.crowd_line: Optional[List[Tuple[float, float, float]]] = None
 
@@ -1014,6 +1133,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
+            with open(path, 'r', encoding='utf-8') as f:
+                self.track_spec = json.load(f)
             name, safety, crowd = parse_track_spec_json(path)
             self.track_spec_path = path
             self.track_spec_name = name or os.path.splitext(os.path.basename(path))[0]
@@ -1028,6 +1149,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f'Error loading track JSON: {exc}')
             self.track_spec_path = None
             self.track_spec_name = None
+            self.track_spec = None
             self.safety_line = None
             self.crowd_line = None
         self.update_map()
@@ -1118,11 +1240,15 @@ class MainWindow(QMainWindow):
             densify_factor=DENSIFY_FACTOR,
             safety_line=self.safety_line,
             crowd_line=self.crowd_line,
+            track_spec=self.track_spec,
+            assets_dir=os.path.join(os.path.dirname(__file__), "assets"),
         )
         try:
             with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(kml)
             self.statusBar().showMessage(f'Saved {save_path}')
+            for msg in GATE_MODEL_WARNINGS:
+                self.statusBar().showMessage(msg, 5000)
         except Exception as exc:
             self.statusBar().showMessage(f'Error: {exc}')
 
