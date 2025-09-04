@@ -734,7 +734,7 @@ def make_gate_models_kml(
             continue
 
         heading = float(gate.get("headingDeg", 0.0))
-        if gtype == "SingleRight":
+        if gtype == "SingleLeft":
             heading += 180.0
         heading = heading % 360.0
 
