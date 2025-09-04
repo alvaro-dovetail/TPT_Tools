@@ -690,24 +690,22 @@ def _find_project_from_any_root(root: object) -> Optional[dict]:
 
 
 def make_gate_models_kml(
-    track_spec: object,
+    track_spec: dict,
     assets_dir: str = "assets",
     *,
     scale: Tuple[float, float, float] = GATE_MODEL_SCALE,
     altitude_mode: str = "absolute",
+    kml_dir: Optional[str] = None,  # <-- added
 ) -> str:
-    """Return concatenated KML placemarks for all gates in a track spec."""
-
     global GATE_MODEL_WARNINGS
     GATE_MODEL_WARNINGS = []
 
-    project = _find_project_from_any_root(track_spec)
-    if not isinstance(project, dict):
+    if not isinstance(track_spec, dict):
         return ""
 
-    # Determine gate list
+    # determine gate_list (unchanged) ...
     gate_list: Optional[List[dict]] = None
-    tracks = project.get("trackList") if isinstance(project.get("trackList"), list) else None
+    tracks = track_spec.get("trackList") if isinstance(track_spec.get("trackList"), list) else None
     if tracks:
         # prefer the first track with gateList
         for tr in tracks:
@@ -727,7 +725,6 @@ def make_gate_models_kml(
     placemarks: List[str] = []
     missing_files: set[str] = set()
     assets_dir_exists = os.path.isdir(assets_dir)
-    assets_base = os.path.basename(os.path.normpath(assets_dir)) or assets_dir
 
     for gate in gate_list:
         gtype = gate.get("type")
@@ -742,24 +739,23 @@ def make_gate_models_kml(
         heading = heading % 360.0
 
         pos = gate.get("position", {}) or {}
-        lat = pos.get("latitude")
-        if lat is None:
-            lat = pos.get("latitudeDeg")
-        lon = pos.get("longitude")
-        if lon is None:
-            lon = pos.get("longitudeDeg")
+        lat = pos.get("latitude") if pos.get("latitude") is not None else pos.get("latitudeDeg")
+        lon = pos.get("longitude") if pos.get("longitude") is not None else pos.get("longitudeDeg")
         if lat is None or lon is None:
             GATE_MODEL_WARNINGS.append(f"Gate {gate.get('id')} missing lat/lon")
             continue
-        elev = pos.get("elevationM")
-        if elev is None:
-            elev = pos.get("elevation", 0.0)
+        elev = pos.get("elevationM", pos.get("elevation", 0.0))
 
-        href = f"{assets_base}/{filename}".replace("\\", "/")
-        if assets_dir_exists:
-            if not os.path.isfile(os.path.join(assets_dir, filename)):
-                missing_files.add(href)
+        # Filesystem path to the model (next to main.py)
+        model_fs_path = os.path.join(assets_dir, filename)
+
+        # KML href relative to the KML output directory
+        if kml_dir:
+            href = os.path.relpath(model_fs_path, kml_dir).replace(os.sep, "/")
         else:
+            href = os.path.join(os.path.basename(os.path.normpath(assets_dir)), filename).replace("\\", "/")
+
+        if not os.path.isfile(model_fs_path):
             missing_files.add(href)
 
         placemarks.append(
@@ -787,7 +783,7 @@ def make_gate_models_kml(
         )
 
     if not assets_dir_exists:
-        GATE_MODEL_WARNINGS.append(f"Missing assets folder: {assets_base}")
+        GATE_MODEL_WARNINGS.append(f"Missing assets folder: {os.path.basename(os.path.normpath(assets_dir)) or assets_dir}")
     for m in sorted(missing_files):
         GATE_MODEL_WARNINGS.append(f"Missing model file: {m}")
 
@@ -807,8 +803,9 @@ def make_kml(
     densify_factor: int = DENSIFY_FACTOR,
     safety_line: Optional[List[Tuple[float, float, float]]] = None,
     crowd_line: Optional[List[Tuple[float, float, float]]] = None,
-    track_spec: object | None = None,
+    track_spec: dict | None = None,
     assets_dir: str = "assets",
+    kml_dir: Optional[str] = None,  # <-- added
 ) -> str:
     def fmt(pt: Tuple[float, float, float]) -> str:
         return f"{pt[0]:.9f},{pt[1]:.9f},{pt[2]:.3f}"
@@ -893,7 +890,7 @@ def make_kml(
 
     safety_kml = line_to_kml("Safety Line", "safety", safety_line) if safety_line else ""
     crowd_kml  = line_to_kml("Crowd Line",  "crowd",  crowd_line)  if crowd_line  else ""
-    gates_kml = make_gate_models_kml(track_spec, assets_dir) if track_spec else ""
+    gates_kml = make_gate_models_kml(track_spec, assets_dir, kml_dir=kml_dir) if track_spec else ""
     gates_folder = f"<Folder>\n  <name>Gates</name>\n  {gates_kml}\n</Folder>" if gates_kml else ""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1233,6 +1230,11 @@ class MainWindow(QMainWindow):
         if not save_path:
             return
 
+        # assets next to main.py, NOT next to the JSON and NOT next to the KML
+        assets_fs_dir = os.path.join(os.path.dirname(__file__), "assets")
+        # the folder where the user is saving the KML
+        kml_dir = os.path.dirname(save_path)
+
         kml = make_kml(
             self.t,
             self.track,          # smoothing applied inside make_kml
@@ -1246,7 +1248,8 @@ class MainWindow(QMainWindow):
             safety_line=self.safety_line,
             crowd_line=self.crowd_line,
             track_spec=self.track_spec,
-            assets_dir=os.path.join(os.path.dirname(__file__), "assets"),
+            assets_dir=assets_fs_dir,   # verify existence here
+            kml_dir=kml_dir,            # build href relative to here
         )
         try:
             with open(save_path, 'w', encoding='utf-8') as f:
