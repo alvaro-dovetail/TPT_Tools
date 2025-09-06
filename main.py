@@ -633,6 +633,7 @@ def make_gx_track_kml(
     track_pts: List[Tuple[float, float, float]],
     arrays: Dict[str, List[float]],
     max_points: int = GX_TRACK_LIMIT,
+    angles_deg: tuple[list[float], list[float], list[float]] | None = None,
 ) -> str:
     """Build a gx:Track placemark with per-sample arrays suitable for GE's Elevation Profile."""
     if not t or not track_pts:
@@ -645,6 +646,21 @@ def make_gx_track_kml(
     N = min(len(t_thin), len(pts_thin))
     t_thin = t_thin[:N]
     pts_thin = pts_thin[:N]
+
+    angle_lines: List[str] = []
+    if angles_deg is not None:
+        hdg, pit, rol = angles_deg
+        hdg_thin = hdg[::step][:N]
+        pit_thin = pit[::step][:N]
+        rol_thin = rol[::step][:N]
+
+        def _nan_to_zero(x: float | None) -> float:
+            return 0.0 if (x is None or not math.isfinite(x)) else float(x)
+
+        angle_lines = [
+            f"<gx:angles>{(_nan_to_zero(h) % 360.0):.3f} {_nan_to_zero(p):.3f} {_nan_to_zero(r):.3f}</gx:angles>"
+            for h, p, r in zip(hdg_thin, pit_thin, rol_thin)
+        ]
 
     # Build <when> + <gx:coord>
     t0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -673,6 +689,7 @@ def make_gx_track_kml(
         f"{ext}"
         f"{''.join(when_lines)}"
         f"{''.join(coord_lines)}"
+        f"{''.join(angle_lines)}"
         "</gx:Track>"
         "</Placemark>"
     )
@@ -876,7 +893,20 @@ def make_kml(
             )
         schema = f"<Schema id=\"ts_schema\">{''.join(fields)}</Schema>"
 
-    gx_track = make_gx_track_kml(t, smoothed_track, arrays)
+    hdg_raw = signals.get("position_pkt.heading") or []
+    pit_raw = signals.get("position_pkt.pitch") or []
+    rol_raw = signals.get("position_pkt.roll") or []
+
+    hdg_s = _moving_average_1d(hdg_raw, smooth_window)
+    pit_s = _moving_average_1d(pit_raw, smooth_window)
+    rol_s = _moving_average_1d(rol_raw, smooth_window)
+    # pit_s = [-p for p in pit_s]  # optional inversion if needed
+
+    angles: tuple[list[float], list[float], list[float]] | None = None
+    if hdg_s and pit_s and rol_s:
+        angles = (hdg_s, pit_s, rol_s)
+
+    gx_track = make_gx_track_kml(t, smoothed_track, arrays, angles_deg=angles)
 
     # Safety & Crowd lines (clampToGround)
     def line_to_kml(name: str, style: str, line: List[Tuple[float, float, float]]) -> str:
@@ -899,7 +929,13 @@ def make_kml(
     <name>{xml_escape(doc_name)}</name>
 
     <!-- Track: green, 80% opacity, width 2 (ABGR in KML) -->
-    <Style id="track"><LineStyle><color>cc00ff00</color><width>2</width></LineStyle></Style>
+    <Style id="track">
+      <IconStyle>
+        <scale>1.2</scale>
+        <Icon><href>http://maps.google.com/mapfiles/kml/shapes/airports.png</href></Icon>
+      </IconStyle>
+      <LineStyle><color>cc00ff00</color><width>2</width></LineStyle>
+    </Style>
     <!-- Rays: yellow-ish, 60% opacity, width 1 -->
     <Style id="rays"><LineStyle><color>9900ffff</color><width>1</width></LineStyle></Style>
     <Style id="envelope"><LineStyle><color>ff00a5ff</color><width>3</width></LineStyle></Style>
