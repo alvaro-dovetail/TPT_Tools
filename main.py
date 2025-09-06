@@ -35,6 +35,7 @@ SMOOTH_WINDOW = 7        # odd >=3 recommended; 1 disables smoothing
 DENSIFY_FACTOR = 6       # >=1; 1 disables densifying
 # 3D gate model scale for KML exports
 GATE_MODEL_SCALE = (1.0, 1.0, 1.0)
+EXTRUSION_HEIGHT_M = 200.0  # height of the vertical "wall" for extruded lines
 
 # Warnings collected during KML generation (e.g. missing assets)
 GATE_MODEL_WARNINGS: List[str] = []
@@ -918,10 +919,47 @@ def make_kml(
       </LineString>
     </Placemark>""".rstrip()
 
+    def line_to_kml_extruded(
+        name: str,
+        style: str,
+        line: List[Tuple[float, float, float]],
+        height_m: float,
+    ) -> str:
+        """
+        Build an extruded LineString at a fixed relative height.
+        Emits <extrude>1</extrude> with <altitudeMode>relativeToGround</altitudeMode>.
+        Coordinates use altitude=height_m so GE draws a “fence” down to ground.
+        """
+        if not line:
+            return ""
+        coords = " ".join(f"{p[0]:.9f},{p[1]:.9f},{height_m:.3f}" for p in line)
+        return f"""
+    <Placemark><name>{xml_escape(name)} extruded</name><styleUrl>#{style}</styleUrl>
+      <LineString>
+        <coordinates>{coords}</coordinates>
+        <extrude>1</extrude>
+        <altitudeMode>relativeToGround</altitudeMode>
+      </LineString>
+    </Placemark>""".rstrip()
+
     safety_kml = line_to_kml("Safety Line", "safety", safety_line) if safety_line else ""
     crowd_kml  = line_to_kml("Crowd Line",  "crowd",  crowd_line)  if crowd_line  else ""
+    safety_kml_ex = line_to_kml_extruded("safetyLine", "safety_ex", safety_line, EXTRUSION_HEIGHT_M) if safety_line else ""
+    crowd_kml_ex  = line_to_kml_extruded("crowdLine",  "crowd_ex",  crowd_line,  EXTRUSION_HEIGHT_M) if crowd_line  else ""
     gates_kml = make_gate_models_kml(track_spec, assets_dir, kml_dir=kml_dir) if track_spec else ""
     gates_folder = f"<Folder>\n  <name>Gates</name>\n  {gates_kml}\n</Folder>" if gates_kml else ""
+
+    safety_folder = ""
+    if any([safety_kml, crowd_kml, safety_kml_ex, crowd_kml_ex]):
+        safety_folder = f"""
+    <Folder>
+      <name>Safety areas</name>
+      {crowd_kml}
+      {crowd_kml_ex}
+      {safety_kml}
+      {safety_kml_ex}
+    </Folder>
+    """.rstrip()
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
@@ -943,6 +981,16 @@ def make_kml(
     <Style id="safety"><LineStyle><color>9900ffff</color><width>8</width></LineStyle></Style>
     <!-- Crowd: #aa00ff, 60% opacity, width 8 -->
     <Style id="crowd"><LineStyle><color>99ff00aa</color><width>8</width></LineStyle></Style>
+    <!-- Extruded Safety: yellow (60%), width 8, with fill -->
+    <Style id="safety_ex">
+      <LineStyle><color>9900ffff</color><width>8</width></LineStyle>
+      <PolyStyle><color>9900ffff</color><fill>1</fill><outline>1</outline></PolyStyle>
+    </Style>
+    <!-- Extruded Crowd: #aa00ff (60%), width 8, with fill -->
+    <Style id="crowd_ex">
+      <LineStyle><color>99ff00aa</color><width>8</width></LineStyle>
+      <PolyStyle><color>99ff00aa</color><fill>1</fill><outline>1</outline></PolyStyle>
+    </Style>
 
     {schema}
 
@@ -962,8 +1010,7 @@ def make_kml(
       </LineString>
     </Placemark>
 
-    {safety_kml}
-    {crowd_kml}
+    {safety_folder}
 
     {gx_track}
 
