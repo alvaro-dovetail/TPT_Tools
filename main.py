@@ -35,7 +35,8 @@ SMOOTH_WINDOW = 7        # odd >=3 recommended; 1 disables smoothing
 DENSIFY_FACTOR = 6       # >=1; 1 disables densifying
 # 3D gate model scale for KML exports
 GATE_MODEL_SCALE = (1.0, 1.0, 1.0)
-EXTRUSION_HEIGHT_M = 200.0  # height of the vertical "wall" for extruded lines
+EXTRUSION_HEIGHT_SAFETY_M = 20.0
+EXTRUSION_HEIGHT_CROWD_M  = 30.0
 
 # Warnings collected during KML generation (e.g. missing assets)
 GATE_MODEL_WARNINGS: List[str] = []
@@ -944,10 +945,13 @@ def make_kml(
 
     safety_kml = line_to_kml("Safety Line", "safety", safety_line) if safety_line else ""
     crowd_kml  = line_to_kml("Crowd Line",  "crowd",  crowd_line)  if crowd_line  else ""
-    safety_kml_ex = line_to_kml_extruded("safetyLine", "safety_ex", safety_line, EXTRUSION_HEIGHT_M) if safety_line else ""
-    crowd_kml_ex  = line_to_kml_extruded("crowdLine",  "crowd_ex",  crowd_line,  EXTRUSION_HEIGHT_M) if crowd_line  else ""
+    safety_kml_ex = line_to_kml_extruded("safetyLine", "safety_ex", safety_line, EXTRUSION_HEIGHT_SAFETY_M) if safety_line else ""
+    crowd_kml_ex  = line_to_kml_extruded("crowdLine",  "crowd_ex",  crowd_line,  EXTRUSION_HEIGHT_CROWD_M) if crowd_line  else ""
     gates_kml = make_gate_models_kml(track_spec, assets_dir, kml_dir=kml_dir) if track_spec else ""
     gates_folder = f"<Folder>\n  <name>Gates</name>\n  {gates_kml}\n</Folder>" if gates_kml else ""
+
+
+
 
     safety_folder = ""
     if any([safety_kml, crowd_kml, safety_kml_ex, crowd_kml_ex]):
