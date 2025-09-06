@@ -630,6 +630,112 @@ def _ffill_numeric(values: List[float], target_len: int) -> List[float]:
     return out
 
 
+def _deg_normalize(h):
+    # Normalize heading to [0, 360)
+    h = float(h) % 360.0
+    return h if h >= 0 else h + 360.0
+
+
+def _deg_clamp(x, lo, hi):
+    return max(lo, min(hi, float(x)))
+
+
+def _heading_from_points(a, b):
+    # Simple equirectangular approximation for heading (deg) from lon/lat in deg
+    lon1, lat1 = math.radians(a[0]), math.radians(a[1])
+    lon2, lat2 = math.radians(b[0]), math.radians(b[1])
+    x = (lon2 - lon1) * math.cos(0.5 * (lat1 + lat2))
+    y = (lat2 - lat1)
+    bearing = math.degrees(math.atan2(x, y))  # 0=N, +E
+    return _deg_normalize(bearing)
+
+
+def build_pov_tour_kml(
+    t: List[float],
+    smoothed_track: List[Tuple[float, float, float]],
+    smoothed_signals: Dict[str, List[float]],
+    *,
+    name: str = "Play me",
+    max_steps: int = 5000,
+    min_dt: float = 0.02,
+    max_dt: float = 0.5,
+    cam_alt_offset_m: float = 1.5,
+    tilt_bias_deg: float = 0.0,
+) -> str:
+    """
+    Build a gx:Tour that flies the Camera along the smoothed track using smoothed
+    heading/pitch/roll. Keeps camera at aircraft position, slightly above by cam_alt_offset_m.
+    """
+    if not t or not smoothed_track or len(t) != len(smoothed_track):
+        return ""
+
+    # Pull smoothed attitude (may be missing)
+    hdg = smoothed_signals.get("hdg_deg")
+    pit = smoothed_signals.get("pitch_deg")
+    rol = smoothed_signals.get("roll_deg")
+
+    n = len(t)
+    if n < 2:
+        return ""
+
+    # Downsample to <= max_steps
+    step = max(1, n // max_steps)
+    indices = list(range(0, n, step))
+    if indices[-1] != n - 1:
+        indices.append(n - 1)
+
+    # Build playlist
+    parts = [f"<gx:Tour><name>{xml_escape(name)}</name><gx:Playlist>"]
+    for k, i in enumerate(indices):
+        lon, lat, alt = smoothed_track[i]
+        # duration from time delta to next sample (clamped). For last frame use max_dt.
+        if i < n - 1:
+            dt = t[min(i + step, n - 1)] - t[i]
+            dur = _deg_clamp(dt, min_dt, max_dt)
+        else:
+            dur = max_dt
+
+        # Heading
+        if hdg and i < len(hdg) and hdg[i] is not None and math.isfinite(hdg[i]):
+            heading = _deg_normalize(hdg[i])
+        else:
+            # Fallback from path geometry
+            j = min(i + step, n - 1) if i < n - 1 else i
+            heading = _heading_from_points(smoothed_track[i], smoothed_track[j] if j != i else smoothed_track[i-1])
+
+        # Pitch -> Camera tilt
+        if pit and i < len(pit) and pit[i] is not None and math.isfinite(pit[i]):
+            tilt = _deg_clamp(90.0 + pit[i] + tilt_bias_deg, 0.0, 180.0)
+        else:
+            tilt = 90.0  # look toward horizon
+
+        # Roll (bank)
+        if rol and i < len(rol) and rol[i] is not None and math.isfinite(rol[i]):
+            roll = _deg_clamp(rol[i], -180.0, 180.0)
+        else:
+            roll = 0.0
+
+        cam_alt = alt + cam_alt_offset_m
+
+        parts.append(
+            "<gx:FlyTo>"
+            f"<gx:duration>{dur:.3f}</gx:duration>"
+            "<gx:flyToMode>smooth</gx:flyToMode>"
+            "<Camera>"
+            f"<longitude>{lon:.9f}</longitude>"
+            f"<latitude>{lat:.9f}</latitude>"
+            f"<altitude>{cam_alt:.3f}</altitude>"
+            "<altitudeMode>absolute</altitudeMode>"
+            f"<heading>{heading:.3f}</heading>"
+            f"<tilt>{tilt:.3f}</tilt>"
+            f"<roll>{roll:.3f}</roll>"
+            "</Camera>"
+            "</gx:FlyTo>"
+        )
+    parts.append("</gx:Playlist></gx:Tour>")
+    return "".join(parts)
+
+
 def make_gx_track_kml(
     t: List[float],
     track_pts: List[Tuple[float, float, float]],
@@ -910,6 +1016,23 @@ def make_kml(
 
     gx_track = make_gx_track_kml(t, smoothed_track, arrays, angles_deg=angles)
 
+    # Prepare smoothed attitude signals for the tour (keys from arrays)
+    smoothed_signals_for_tour = {
+        "hdg_deg": arrays.get("hdg_deg"),
+        "pitch_deg": arrays.get("pitch_deg"),
+        "roll_deg": arrays.get("roll_deg"),
+    }
+
+    tour_kml = build_pov_tour_kml(
+        t, smoothed_track, smoothed_signals_for_tour,
+        name="Play me",
+        max_steps=5000,       # keep KML light
+        min_dt=0.02,          # lower bound per-step duration
+        max_dt=0.35,          # slightly faster default playback
+        cam_alt_offset_m=1.5, # “cockpit” height above track altitude
+        tilt_bias_deg=0.0     # tweak if you want a default nose-down/up bias
+    )
+
     # Safety & Crowd lines (clampToGround)
     def line_to_kml(name: str, style: str, line: List[Tuple[float, float, float]]) -> str:
         coords = " ".join(f"{p[0]:.9f},{p[1]:.9f},0" for p in line)
@@ -1019,7 +1142,7 @@ def make_kml(
     {gx_track}
 
     {gates_folder}
-
+    {tour_kml}
   </Document>
 </kml>"""
 
