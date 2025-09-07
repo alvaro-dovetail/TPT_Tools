@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QLabel,
+    QCheckBox,
+    QComboBox,
 )
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg as FigureCanvas,
@@ -706,113 +708,6 @@ def _ffill_numeric(values: List[float], target_len: int) -> List[float]:
     return out
 
 
-def _deg_normalize(h):
-    # Normalize heading to [0, 360)
-    h = float(h) % 360.0
-    return h if h >= 0 else h + 360.0
-
-
-def _deg_clamp(x, lo, hi):
-    return max(lo, min(hi, float(x)))
-
-
-def _heading_from_points(a, b):
-    # Simple equirectangular approximation for heading (deg) from lon/lat in deg
-    lon1, lat1 = math.radians(a[0]), math.radians(a[1])
-    lon2, lat2 = math.radians(b[0]), math.radians(b[1])
-    x = (lon2 - lon1) * math.cos(0.5 * (lat1 + lat2))
-    y = (lat2 - lat1)
-    bearing = math.degrees(math.atan2(x, y))  # 0=N, +E
-    return _deg_normalize(bearing)
-
-
-def build_pov_tour_kml(
-    t: List[float],
-    smoothed_track: List[Tuple[float, float, float]],
-    smoothed_signals: Dict[str, List[float]],
-    *,
-    name: str = "Play me",
-    max_steps: int = 5000,
-    min_dt: float = 0.02,
-    max_dt: float = 0.5,
-    cam_alt_offset_m: float = 1.5,
-    tilt_bias_deg: float = 0.0,
-    roll_sign: float = -1.0,
-) -> str:
-    """
-    Build a gx:Tour that flies the Camera along the smoothed track using smoothed
-    heading/pitch/roll. Keeps camera at aircraft position, slightly above by cam_alt_offset_m.
-    """
-    if not t or not smoothed_track or len(t) != len(smoothed_track):
-        return ""
-
-    # Pull smoothed attitude (may be missing)
-    hdg = smoothed_signals.get("hdg_deg")
-    pit = smoothed_signals.get("pitch_deg")
-    rol = smoothed_signals.get("roll_deg")
-
-    n = len(t)
-    if n < 2:
-        return ""
-
-    # Downsample to <= max_steps
-    step = max(1, n // max_steps)
-    indices = list(range(0, n, step))
-    if indices[-1] != n - 1:
-        indices.append(n - 1)
-
-    # Build playlist
-    parts = [f"<gx:Tour><name>{xml_escape(name)}</name><gx:Playlist>"]
-    for k, i in enumerate(indices):
-        lon, lat, alt = smoothed_track[i]
-        # duration from time delta to next sample (clamped). For last frame use max_dt.
-        if i < n - 1:
-            dt = t[min(i + step, n - 1)] - t[i]
-            dur = _deg_clamp(dt, min_dt, max_dt)
-        else:
-            dur = max_dt
-
-        # Heading
-        if hdg and i < len(hdg) and hdg[i] is not None and math.isfinite(hdg[i]):
-            heading = _deg_normalize(hdg[i])
-        else:
-            # Fallback from path geometry
-            j = min(i + step, n - 1) if i < n - 1 else i
-            heading = _heading_from_points(smoothed_track[i], smoothed_track[j] if j != i else smoothed_track[i-1])
-
-        # Pitch -> Camera tilt
-        if pit and i < len(pit) and pit[i] is not None and math.isfinite(pit[i]):
-            tilt = _deg_clamp(90.0 + pit[i] + tilt_bias_deg, 0.0, 180.0)
-        else:
-            tilt = 90.0  # look toward horizon
-
-        # Roll (bank)
-        if rol and i < len(rol) and rol[i] is not None and math.isfinite(rol[i]):
-            roll = _deg_clamp(roll_sign * rol[i], -180.0, 180.0)
-        else:
-            roll = 0.0
-
-        cam_alt = alt + cam_alt_offset_m
-
-        parts.append(
-            "<gx:FlyTo>"
-            f"<gx:duration>{dur:.3f}</gx:duration>"
-            "<gx:flyToMode>smooth</gx:flyToMode>"
-            "<Camera>"
-            f"<longitude>{lon:.9f}</longitude>"
-            f"<latitude>{lat:.9f}</latitude>"
-            f"<altitude>{cam_alt:.3f}</altitude>"
-            "<altitudeMode>absolute</altitudeMode>"
-            f"<heading>{heading:.3f}</heading>"
-            f"<tilt>{tilt:.3f}</tilt>"
-            f"<roll>{roll:.3f}</roll>"
-            "</Camera>"
-            "</gx:FlyTo>"
-        )
-    parts.append("</gx:Playlist></gx:Tour>")
-    return "".join(parts)
-
-
 def make_gx_track_kml(
     t: List[float],
     track_pts: List[Tuple[float, float, float]],
@@ -1006,6 +901,8 @@ def make_kml(
     safety_line: Optional[List[Tuple[float, float, float]]] = None,
     crowd_line: Optional[List[Tuple[float, float, float]]] = None,
     track_spec: dict | None = None,
+    export_gates: bool = True,
+    tour_speed_divider: int = 1,
     assets_dir: str = "assets",
     kml_dir: Optional[str] = None,  # <-- added
 ) -> str:
@@ -1096,23 +993,56 @@ def make_kml(
 
     gx_track = make_gx_track_kml(t, smoothed_track, arrays, angles_deg=angles)
 
-    # Prepare smoothed attitude signals for the tour (keys from arrays)
-    smoothed_signals_for_tour = {
-        "hdg_deg": arrays.get("hdg_deg"),
-        "pitch_deg": arrays.get("pitch_deg"),
-        "roll_deg": arrays.get("roll_deg"),
-    }
+    # POV tour built from smoothed track and attitudes
+    def _get_smoothed(name: str, default: List[float]) -> List[float]:
+        vals = signals.get(name)
+        if not vals:
+            return default
+        return _smooth_angle_deg(vals, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA) if name in ANGLE_KEYS else _smooth_1d(vals, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
 
-    tour_kml = build_pov_tour_kml(
-        t, smoothed_track, smoothed_signals_for_tour,
-        name="Play me",
-        max_steps=5000,       # keep KML light
-        min_dt=0.02,          # lower bound per-step duration
-        max_dt=0.35,          # slightly faster default playback
-        cam_alt_offset_m=1.5, # “cockpit” height above track altitude
-        tilt_bias_deg=0.0,    # tweak if you want a default nose-down/up bias
-        roll_sign=-1.0        # invert bank for GE
-    )
+    hdg_s = _get_smoothed("position_pkt.heading", [0.0] * len(t))
+    pit_s = _get_smoothed("position_pkt.pitch",   [0.0] * len(t))
+    rol_s = _get_smoothed("position_pkt.roll",    [0.0] * len(t))
+
+    def _camera_for(i: int, lon: float, lat: float, alt: float) -> str:
+        heading = (hdg_s[i] if i < len(hdg_s) else 0.0) % 360.0
+        pitch =  pit_s[i] if i < len(pit_s) else 0.0
+        roll =  rol_s[i] if i < len(rol_s) else 0.0
+        tilt = max(0.0, min(180.0, 90.0 + pitch))
+        return (
+            "<Camera>"
+            f"<longitude>{lon:.9f}</longitude>"
+            f"<latitude>{lat:.9f}</latitude>"
+            f"<altitude>{alt:.3f}</altitude>"
+            f"<heading>{heading:.3f}</heading>"
+            f"<tilt>{tilt:.3f}</tilt>"
+            f"<roll>{roll:.3f}</roll>"
+            "<altitudeMode>absolute</altitudeMode>"
+            "</Camera>"
+        )
+
+    tour_items: List[str] = []
+    steps = min(len(smoothed_track), len(t)) - 1
+    if steps > 0:
+        for i in range(steps):
+            lon, lat, alt = smoothed_track[i]
+            dt = max(0.01, (t[i + 1] - t[i]) * float(tour_speed_divider))
+            cam = _camera_for(i, lon, lat, alt)
+            tour_items.append(
+                "<gx:FlyTo>"
+                f"<gx:duration>{dt:.3f}</gx:duration>"
+                "<gx:flyToMode>smooth</gx:flyToMode>"
+                f"{cam}"
+                "</gx:FlyTo>"
+            )
+
+    tour_kml = ""
+    if tour_items:
+        tour_kml = (
+            "<gx:Tour><name>POV Tour</name><gx:Playlist>"
+            + "".join(tour_items)
+            + "</gx:Playlist></gx:Tour>"
+        )
 
     # Safety & Crowd lines (clampToGround)
     def line_to_kml(name: str, style: str, line: List[Tuple[float, float, float]]) -> str:
@@ -1151,7 +1081,7 @@ def make_kml(
     crowd_kml  = line_to_kml("Crowd Line",  "crowd",  crowd_line)  if crowd_line  else ""
     safety_kml_ex = line_to_kml_extruded("safetyLine", "safety_ex", safety_line, EXTRUSION_HEIGHT_SAFETY_M) if safety_line else ""
     crowd_kml_ex  = line_to_kml_extruded("crowdLine",  "crowd_ex",  crowd_line,  EXTRUSION_HEIGHT_CROWD_M) if crowd_line  else ""
-    gates_kml = make_gate_models_kml(track_spec, assets_dir, kml_dir=kml_dir) if track_spec else ""
+    gates_kml = make_gate_models_kml(track_spec, assets_dir, kml_dir=kml_dir) if (export_gates and track_spec) else ""
     gates_folder = f"<Folder>\n  <name>Gates</name>\n  {gates_kml}\n</Folder>" if gates_kml else ""
 
 
@@ -1323,11 +1253,28 @@ class MainWindow(QMainWindow):
         self.spec_label = QLabel("Track spec: —")
         self.spec_label.setStyleSheet("color: #666;")
 
+        self.export_gates_cb = QCheckBox("Export gates")
+        self.export_gates_cb.setChecked(True)
+        self.export_gates_cb.setToolTip("Include 3D gate models from the loaded Track JSON in the KML")
+
+        self.tour_speed_combo = QComboBox()
+        self.tour_speed_combo.addItems(["1x","2x","4x","8x"])
+        self.tour_speed_combo.setCurrentIndex(0)
+        self.tour_speed_combo.setToolTip("Multiply the Tour durations to slow down playback in Google Earth")
+
+        # Initially disabled until a track JSON is loaded
+        self.export_gates_cb.setEnabled(False)
+        self.export_gates_cb.setToolTip("Load a Track JSON to export 3D gates")
+
         top = QHBoxLayout()
         top.addWidget(open_btn)
         top.addWidget(load_track_btn)
         top.addWidget(self.rays_spin)
         top.addWidget(self.export_btn)
+        top.addWidget(self.export_gates_cb)
+        top.addSpacing(8)
+        top.addWidget(QLabel("Tour speed:"))
+        top.addWidget(self.tour_speed_combo)
         top.addStretch(1)
         top.addWidget(self.loaded_label)
         top.addSpacing(12)
@@ -1438,6 +1385,8 @@ class MainWindow(QMainWindow):
                 f'Loaded track JSON "{os.path.basename(path)}"  '
                 f'({"safety" if safety else "no safety"}/{ "crowd" if crowd else "no crowd"})'
             )
+            self.export_gates_cb.setEnabled(True)
+            self.export_gates_cb.setToolTip("Include 3D gate models from the loaded Track JSON in the KML")
         except Exception as exc:
             self.statusBar().showMessage(f'Error loading track JSON: {exc}')
             self.track_spec_path = None
@@ -1445,6 +1394,8 @@ class MainWindow(QMainWindow):
             self.track_spec = None
             self.safety_line = None
             self.crowd_line = None
+            self.export_gates_cb.setEnabled(False)
+            self.export_gates_cb.setToolTip("Load a Track JSON to export 3D gates")
         self.update_map()
 
     def update_map(self) -> None:
@@ -1531,6 +1482,12 @@ class MainWindow(QMainWindow):
         # the folder where the user is saving the KML
         kml_dir = os.path.dirname(save_path)
 
+        export_gates = self.export_gates_cb.isChecked()
+        try:
+            tour_speed_div = int(self.tour_speed_combo.currentText().replace("x", ""))
+        except Exception:
+            tour_speed_div = 1
+
         kml = make_kml(
             self.t,
             self.track,          # smoothing applied inside make_kml
@@ -1544,6 +1501,8 @@ class MainWindow(QMainWindow):
             safety_line=self.safety_line,
             crowd_line=self.crowd_line,
             track_spec=self.track_spec,
+            export_gates=export_gates,
+            tour_speed_divider=tour_speed_div,
             assets_dir=assets_fs_dir,   # verify existence here
             kml_dir=kml_dir,            # build href relative to here
         )
