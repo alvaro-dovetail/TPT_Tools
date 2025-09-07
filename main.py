@@ -661,6 +661,7 @@ def build_pov_tour_kml(
     max_dt: float = 0.5,
     cam_alt_offset_m: float = 1.5,
     tilt_bias_deg: float = 0.0,
+    roll_sign: float = -1.0,
 ) -> str:
     """
     Build a gx:Tour that flies the Camera along the smoothed track using smoothed
@@ -711,7 +712,7 @@ def build_pov_tour_kml(
 
         # Roll (bank)
         if rol and i < len(rol) and rol[i] is not None and math.isfinite(rol[i]):
-            roll = _deg_clamp(rol[i], -180.0, 180.0)
+            roll = _deg_clamp(roll_sign * rol[i], -180.0, 180.0)
         else:
             roll = 0.0
 
@@ -1030,7 +1031,8 @@ def make_kml(
         min_dt=0.02,          # lower bound per-step duration
         max_dt=0.35,          # slightly faster default playback
         cam_alt_offset_m=1.5, # “cockpit” height above track altitude
-        tilt_bias_deg=0.0     # tweak if you want a default nose-down/up bias
+        tilt_bias_deg=0.0,    # tweak if you want a default nose-down/up bias
+        roll_sign=-1.0        # invert bank for GE
     )
 
     # Safety & Crowd lines (clampToGround)
