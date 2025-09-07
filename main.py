@@ -33,6 +33,17 @@ import matplotlib
 # TUNABLES for visual smoothing / densifying
 SMOOTH_WINDOW = 7        # odd >=3 recommended; 1 disables smoothing
 DENSIFY_FACTOR = 6       # >=1; 1 disables densifying
+# Smoothing method/strength
+SMOOTH_METHOD = "gaussian"   # "ma" | "gaussian"
+SMOOTH_SIGMA  = None         # None => auto (window/2.5). Or set like 0.35 * SMOOTH_WINDOW
+
+# Which series should be smoothed as circular angles (wrap at 360°)?
+ANGLE_KEYS = {
+    "position_pkt.heading",   # definitely circular
+    # Uncomment if your roll/pitch can cross ±180 often and you want wrap-safe smoothing too:
+    # "position_pkt.roll",
+    # "position_pkt.pitch",
+}
 # 3D gate model scale for KML exports
 GATE_MODEL_SCALE = (1.0, 1.0, 1.0)
 EXTRUSION_HEIGHT_SAFETY_M = 20.0
@@ -557,38 +568,103 @@ class SharedCrosshair:
 
 # Helpers for smoothing / densifying -----------------------------------------
 
-def _moving_average_path(
-    points: List[Tuple[float, float, float]], window: int
-) -> List[Tuple[float, float, float]]:
-    """Edge-preserving moving average on lon/lat/alt; length preserved."""
-    if window is None or window <= 1 or len(points) < 3:
-        return points
+def _gaussian_kernel(window: int, sigma: Optional[float]) -> np.ndarray:
     if window % 2 == 0:
         window += 1
-    arr = np.asarray(points, dtype=float)  # Nx3
-    pad = window // 2
-    arrp = np.pad(arr, ((pad, pad), (0, 0)), mode='edge')
-    kernel = np.ones(window, dtype=float) / window
-    smoothed = np.empty_like(arr)
-    for col in range(3):
-        smoothed[:, col] = np.convolve(arrp[:, col], kernel, mode='valid')
-    return [tuple(row) for row in smoothed.tolist()]
+    if sigma is None or sigma <= 0:
+        sigma = window / 2.5
+    half = window // 2
+    x = np.arange(-half, half + 1, dtype=float)
+    k = np.exp(-0.5 * (x / sigma) ** 2)
+    k /= k.sum()
+    return k
 
 
-def _moving_average_1d(values: List[float], window: int) -> List[float]:
-    """Edge-preserving moving average for 1D time series; length preserved."""
+def _nan_interpolate(arr: np.ndarray) -> np.ndarray:
+    """Fill NaNs by linear interp between valid samples (endpoints held)."""
+    y = arr.copy()
+    n = y.size
+    idx = np.arange(n)
+    mask = ~np.isnan(y)
+    if mask.any():
+        first = np.argmax(mask)
+        last = n - 1 - np.argmax(mask[::-1])
+        y[:first] = y[first]
+        y[last + 1:] = y[last]
+        y[~mask] = np.interp(idx[~mask], idx[mask], y[mask])
+    return y
+
+
+def _smooth_1d(values: List[float], window: int, *, method: str = "gaussian",
+               sigma: Optional[float] = None) -> List[float]:
     if window is None or window <= 1 or len(values) < 3:
         return values
+    if method == "ma":
+        if window % 2 == 0:
+            window += 1
+        pad = window // 2
+        arr = np.asarray(values, dtype=float)
+        arrp = np.pad(arr, pad, mode="edge")
+        k = np.ones(window, dtype=float) / window
+        sm = np.convolve(arrp, k, mode="valid")
+        sm[np.isnan(np.asarray(values))] = np.nan
+        return sm.tolist()
+    # gaussian (default)
     if window % 2 == 0:
         window += 1
-    arr = np.asarray(values, dtype=float)
+    k = _gaussian_kernel(window, sigma)
     pad = window // 2
-    kernel = np.ones(window, dtype=float) / window
-    arrp = np.pad(arr, pad, mode='edge')
-    smoothed = np.convolve(arrp, kernel, mode='valid')
+    arr = np.asarray(values, dtype=float)
     nan_mask = np.isnan(arr)
-    smoothed[nan_mask] = np.nan
-    return smoothed.tolist()
+    arr_filled = _nan_interpolate(arr)
+    arrp = np.pad(arr_filled, pad, mode="edge")
+    sm = np.convolve(arrp, k, mode="valid")
+    sm[nan_mask] = np.nan
+    return sm.tolist()
+
+
+def _smooth_angle_deg(values: List[float], window: int, *,
+                      method: str = "gaussian",
+                      sigma: Optional[float] = None,
+                      period: float = 360.0) -> List[float]:
+    """Wrap-safe smoothing: average on the unit circle, then atan2."""
+    if window is None or window <= 1 or len(values) < 3:
+        return values
+    arr = np.asarray(values, dtype=float)
+    rad = np.deg2rad(arr % period)
+    x = np.cos(rad)
+    y = np.sin(rad)
+    xs = _smooth_1d(x.tolist(), window, method=method, sigma=sigma)
+    ys = _smooth_1d(y.tolist(), window, method=method, sigma=sigma)
+    ang = np.rad2deg(np.arctan2(ys, xs))
+    # Map to [-180, 180) to keep it pretty
+    ang = ((ang + 180.0) % 360.0) - 180.0
+    # Preserve NaNs where original was NaN
+    nan_mask = np.isnan(arr)
+    ang = np.asarray(ang)
+    ang[nan_mask] = np.nan
+    return ang.tolist()
+
+
+def _smooth_path(points: List[Tuple[float, float, float]], window: int,
+                 *, method: str = "gaussian", sigma: Optional[float] = None
+) -> List[Tuple[float, float, float]]:
+    if window is None or window <= 1 or len(points) < 3:
+        return points
+    arr = np.asarray(points, dtype=float)  # Nx3 (lon, lat, alt)
+    if method == "ma":
+        k = np.ones(window, dtype=float) / window
+    else:
+        if window % 2 == 0:
+            window += 1
+        k = _gaussian_kernel(window, sigma)
+    pad = len(k) // 2
+    out = np.empty_like(arr)
+    for col in range(arr.shape[1]):
+        colv = arr[:, col]
+        colp = np.pad(colv, pad, mode="edge")
+        out[:, col] = np.convolve(colp, k, mode="valid")
+    return [tuple(row) for row in out.tolist()]
 
 
 def _densify_line(
@@ -937,7 +1013,7 @@ def make_kml(
         return f"{pt[0]:.9f},{pt[1]:.9f},{pt[2]:.3f}"
 
     # --- Apply smoothing to track coordinates ---
-    smoothed_track = _moving_average_path(track, smooth_window)
+    smoothed_track = _smooth_path(track, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
 
     # --- Build visual track (densified from smoothed) ---
     dense_track = _densify_line(smoothed_track, densify_factor)
@@ -989,7 +1065,10 @@ def make_kml(
                 converted_vals = [float('nan') if (v is None or not math.isfinite(v)) else conv(v) for v in vals]
             else:
                 converted_vals = vals
-            smoothed_vals = _moving_average_1d(converted_vals, smooth_window)
+            if src in ANGLE_KEYS:
+                smoothed_vals = _smooth_angle_deg(converted_vals, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
+            else:
+                smoothed_vals = _smooth_1d(converted_vals, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
             arrays[name] = smoothed_vals
             display_names[name] = disp
 
@@ -1006,9 +1085,9 @@ def make_kml(
     pit_raw = signals.get("position_pkt.pitch") or []
     rol_raw = signals.get("position_pkt.roll") or []
 
-    hdg_s = _moving_average_1d(hdg_raw, smooth_window)
-    pit_s = _moving_average_1d(pit_raw, smooth_window)
-    rol_s = _moving_average_1d(rol_raw, smooth_window)
+    hdg_s = _smooth_angle_deg(hdg_raw, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
+    pit_s = _smooth_angle_deg(pit_raw, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
+    rol_s = _smooth_angle_deg(rol_raw, smooth_window, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
     # pit_s = [-p for p in pit_s]  # optional inversion if needed
 
     angles: tuple[list[float], list[float], list[float]] | None = None
@@ -1370,7 +1449,7 @@ class MainWindow(QMainWindow):
 
     def update_map(self) -> None:
         # Apply smoothing to track for display
-        smoothed_track = _moving_average_path(self.track, SMOOTH_WINDOW)
+        smoothed_track = _smooth_path(self.track, SMOOTH_WINDOW, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
         # Update rays to use smoothed track as start points
         smoothed_rays = list(zip(smoothed_track, self.endpoints)) if len(smoothed_track) == len(self.endpoints) else self.rays
         render_map(
@@ -1394,7 +1473,12 @@ class MainWindow(QMainWindow):
             self.crosshair = None
 
         # Smooth all signals for plotting
-        smoothed_signals = {k: _moving_average_1d(v, SMOOTH_WINDOW) for k, v in self.signals.items()}
+        smoothed_signals = {}
+        for k, v in self.signals.items():
+            if k in ANGLE_KEYS:
+                smoothed_signals[k] = _smooth_angle_deg(v, SMOOTH_WINDOW, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
+            else:
+                smoothed_signals[k] = _smooth_1d(v, SMOOTH_WINDOW, method=SMOOTH_METHOD, sigma=SMOOTH_SIGMA)
 
         # Re-render plots
         axis_keys, axes, axis_data = render_timeseries(
