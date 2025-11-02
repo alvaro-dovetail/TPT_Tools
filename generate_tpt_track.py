@@ -4,6 +4,7 @@
 import json
 import math
 from pathlib import Path
+import uuid
 
 import numpy as np
 import osmnx as ox
@@ -93,10 +94,15 @@ def interpolate_gates(line: LineString, num_gates: int = 200) -> list:
 def build_sequence(gates: list) -> list:
     """Create the sequence array referencing each gate in order."""
     sequence = []
-    for gate in gates:
-        entry = {"gateId": gate["id"]}
-        if gate["type"] in {"StartGate", "FinishGate"}:
-            entry["type"] = gate["type"]
+    for index, gate in enumerate(gates):
+        entry = {
+            "gateId": gate["id"],
+            "id": uuid.uuid4().hex,
+        }
+        if index == 0:
+            entry["type"] = "StartGate"
+        elif index == len(gates) - 1:
+            entry["type"] = "FinishGate"
         sequence.append(entry)
 
     # Append an extra finish gate entry marking the finish line from the opposite direction.
@@ -106,6 +112,7 @@ def build_sequence(gates: list) -> list:
                 "gateId": gates[-1]["id"],
                 "type": "FinishGate",
                 "opposite": True,
+                "id": uuid.uuid4().hex,
             }
         )
     return sequence
@@ -145,6 +152,7 @@ def main() -> None:
     track_line = download_track_line(place_name)
     gates = interpolate_gates(track_line, num_gates=200)
     sequence = build_sequence(gates)
+    print(f"Added {len(sequence)} sequence IDs (StartGate → FinishGate)")
 
     # Assemble the project structure and export it as JSON.
     project = build_project_structure(gates, sequence)
